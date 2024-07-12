@@ -194,7 +194,7 @@ fn cflags(b: *Build, flags: []const []const u8) [][]const u8 {
             "-DSQLITE_ENABLE_MATH_FUNCTIONS",
             // "-DSQLITE_TEMP_STORE=2",
             // "-DSQLITE_USE_URI=1",
-            "-DSQLITE_THREADSAFE=1",
+            // "-DSQLITE_THREADSAFE=1",
             "-D_HAVE_SQLITE_CONFIG",
             "-DSQLITE_CORE",
         },
@@ -308,7 +308,7 @@ fn addLibsql(b: *Build, options: Sqlite3Options) *Build.Step.Compile {
     const lemon = b.addExecutable(.{
         .name = "lemon",
         .root_source_file = null,
-        .target = options.target,
+        .target = b.host,
         .optimize = .ReleaseFast,
     });
     lemon.addCSourceFile(.{ .file = b.path("tool/lemon.c") });
@@ -332,7 +332,7 @@ fn addLibsql(b: *Build, options: Sqlite3Options) *Build.Step.Compile {
         const mkkeywordhash = b.addExecutable(.{
             .name = "mkkeywordhash",
             .root_source_file = null,
-            .target = options.target,
+            .target = b.host,
             .optimize = .ReleaseFast,
         });
         mkkeywordhash.addCSourceFile(.{ .file = b.path("tool/mkkeywordhash.c") });
@@ -512,7 +512,7 @@ fn addLibsql(b: *Build, options: Sqlite3Options) *Build.Step.Compile {
         lib.linkSystemLibrary("libsql_wasm");
     }
 
-    if (options.icu) {
+    if (options.icu and options.target.result.os.tag != .wasi) {
         lib.addCSourceFiles(.{
             .files = &.{"ext/icu/icu.c"},
             .flags = cflags(b, &.{}),
@@ -536,7 +536,7 @@ fn addLibsql(b: *Build, options: Sqlite3Options) *Build.Step.Compile {
         lib.root_module.addCMacro("SQLITE_ENABLE_PREUPDATE_HOOK", "1");
     }
 
-    if (options.@"test") {
+    if (options.@"test" and options.target.result.os.tag != .wasi) {
         lib.installHeader(keywordhash.h, "keywordhash.h");
         lib.installHeader(opcodes.h, "opcodes.h");
 
@@ -551,6 +551,8 @@ fn addLibsql(b: *Build, options: Sqlite3Options) *Build.Step.Compile {
         lib.root_module.addCMacro("SQLITE_WASI", "1");
         lib.root_module.addCMacro("SQLITE_OMIT_SHARED_MEM", "1");
         lib.root_module.addCMacro("SQLITE_OMIT_SHARED_CACHE", "1");
+    } else {
+        lib.root_module.addCMacro("SQLITE_THREADSAFE", "1");
     }
 
     if (options.target.result.os.tag == .windows) {
@@ -564,27 +566,21 @@ fn addLibsql(b: *Build, options: Sqlite3Options) *Build.Step.Compile {
     lib.root_module.addCMacro("SQLITE_ENABLE_STMTVTAB", "1");
     lib.root_module.addCMacro("SQLITE_ENABLE_BYTECODE_VTAB", "1");
     lib.root_module.addCMacro("SQLITE_ENABLE_COLUMN_METADATA", "1");
-
     lib.root_module.addCMacro("SQLITE_ENABLE_LOAD_EXTENSION", "1");
+    lib.root_module.addCMacro("SQLITE_ENABLE_API_ARMOR", "1");
+    lib.root_module.addCMacro("SQLITE_ENABLE_COLUMN_METADATA", "1");
+    lib.root_module.addCMacro("SQLITE_ENABLE_JSON1", "1");
+    lib.root_module.addCMacro("SQLITE_ENABLE_MEMORY_MANAGEMENT", "1");
+    lib.root_module.addCMacro("SQLITE_ENABLE_STAT2", "1");
+    lib.root_module.addCMacro("SQLITE_ENABLE_STAT4", "1");
 
-    // lib.root_module.addCMacro("SQLITE_DEFAULT_FOREIGN_KEYS", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_API_ARMOR", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_COLUMN_METADATA", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_DBSTAT_VTAB", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_FTS3", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_FTS3_PARENTHESIS", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_FTS5", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_JSON1", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_MEMORY_MANAGEMENT", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_RTREE", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_STAT2", "1");
-    // lib.root_module.addCMacro("SQLITE_ENABLE_STAT4", "1");
-    // lib.root_module.addCMacro("SQLITE_SOUNDEX", "1");
-    // lib.root_module.addCMacro("SQLITE_THREADSAFE", "1");
+    lib.root_module.addCMacro("SQLITE_DEFAULT_FOREIGN_KEYS", "1");
+    lib.root_module.addCMacro("SQLITE_SOUNDEX", "1");
     lib.root_module.addCMacro("SQLITE_USE_URI", "1");
-    // lib.root_module.addCMacro("HAVE_USLEEP", "1");
 
-    lib.root_module.addCMacro("SQLITE_ENABLE_EXPLAIN_COMMENTS", "1");
+    if (options.optimize == .Debug) {
+        lib.root_module.addCMacro("SQLITE_ENABLE_EXPLAIN_COMMENTS", "1");
+    }
 
     if (options.wasm_runtime) {
         const libsql_wasm = crab.addCargoBuild(b, .{
@@ -607,8 +603,6 @@ fn addLibsql(b: *Build, options: Sqlite3Options) *Build.Step.Compile {
         lib.addLibraryPath(libsql_wasm);
         lib.linkSystemLibrary("libsql_wasm");
     }
-
-    if (options.icu) {}
 
     return lib;
 }
@@ -777,7 +771,23 @@ pub fn build(b: *std.Build) void {
         step.dependOn(&run.step);
     }
 
-    b.getInstallStep().dependOn(&b.addInstallArtifact(testfixture, .{}).step);
+    {
+        const enc_test = b.addTest(.{
+            .optimize = optimize,
+            .target = target,
+            .root_source_file = b.path("src/encryption.zig"),
+        });
+        enc_test.linkLibrary(libsql);
+
+        const run = b.addRunArtifact(enc_test);
+        run.has_side_effects = true;
+
+        const step = b.step("test-zig", "run encryption.zig tests");
+
+        step.dependOn(&run.step);
+    }
+
+
     b.getInstallStep().dependOn(&b.addInstallArtifact(fuzzcheck, .{}).step);
     b.getInstallStep().dependOn(&b.addInstallArtifact(libsql, .{}).step);
 }
