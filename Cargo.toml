@@ -19,6 +19,7 @@ members = [
   "libsql-wal",
   "libsql-storage",
   "libsql-storage-server",
+  "libsql-crypt",
 ]
 
 exclude = [
@@ -46,6 +47,10 @@ rusqlite = { package = "libsql-rusqlite", path = "vendored/rusqlite", version = 
 hyper = { version = "0.14" }
 tower = { version = "0.4.13" }
 zerocopy = { version = "0.7.32", features = ["derive", "alloc"] }
+
+libsql-crypt = { path = "./libsql-crypt" }
+libsql-wal = { path = "./libsql-wal" }
+libsql-sys = { path = "./libsql-sys" }
 
 # Config for 'cargo dist'
 [workspace.metadata.dist]

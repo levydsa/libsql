@@ -1,9 +1,14 @@
+use core::slice;
+use std::cell::Cell;
 use std::ffi::{c_int, CStr};
 use std::num::NonZeroU32;
+use std::pin::Pin;
+use std::ptr;
 
 pub use crate::ffi::Error;
 use crate::ffi::*;
 
+use bytes::BufMut;
 pub use sqlite3_wal::{Sqlite3Wal, Sqlite3WalManager};
 
 pub mod either;
@@ -117,11 +122,11 @@ pub struct PageHeaders {
 }
 
 impl PageHeaders {
-    pub(crate) fn as_ptr(&self) -> *const libsql_pghdr {
+    pub fn as_ptr(&self) -> *const libsql_pghdr {
         self.inner
     }
 
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut libsql_pghdr {
+    pub fn as_mut_ptr(&mut self) -> *mut libsql_pghdr {
         self.inner
     }
 
@@ -134,6 +139,63 @@ impl PageHeaders {
     pub fn iter(&self) -> PageHdrIter {
         // TODO: move LIBSQL_PAGE_SIZE
         PageHdrIter::new(self.as_ptr(), 4096)
+    }
+}
+
+pub const LIBSQL_PAGE_SIZE: usize = 4096;
+
+pub struct PageHeaderPool {
+    pub headers: Pin<Box<[libsql_pghdr]>>,
+    pub pages: Pin<Box<[[u8; LIBSQL_PAGE_SIZE]]>>,
+}
+
+impl From<*const libsql_pghdr> for PageHeaderPool {
+    fn from(first: *const libsql_pghdr) -> Self {
+        let mut pages: Vec<[u8; LIBSQL_PAGE_SIZE]> = Vec::new();
+        let mut headers: Vec<libsql_pghdr> = Vec::new();
+
+        let mut current_header: *const libsql_pghdr = first;
+
+        while let Some(header) = unsafe { current_header.as_ref() } {
+            let page = header.pData as *const u8;
+            let page = unsafe { slice::from_raw_parts(page, LIBSQL_PAGE_SIZE) };
+
+            pages.push(page.try_into().unwrap());
+
+            headers.push(libsql_pghdr {
+                pData: ptr::null_mut(),
+                pDirty: ptr::null_mut(),
+                ..header.clone()
+            });
+
+            current_header = header.pDirty;
+        }
+
+        Cell::from_mut(headers.as_mut_slice())
+            .as_slice_of_cells()
+            .windows(2)
+            .for_each(|window| {
+                let [current, next] = window else {
+                    unreachable!()
+                };
+
+                current.set(libsql_pghdr {
+                    pDirty: next.as_ptr(),
+                    ..current.get()
+                })
+            });
+
+        headers
+            .iter_mut()
+            .zip(pages.iter_mut())
+            .for_each(|(header, page)| {
+                header.pData = page.as_mut_ptr().cast();
+            });
+
+        Self {
+            headers: Pin::from(Box::from(headers)),
+            pages: Pin::from(pages.into_boxed_slice()),
+        }
     }
 }
 
@@ -233,4 +295,12 @@ pub trait Wal {
     fn callback(&self) -> i32;
 
     fn frames_in_wal(&self) -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn construct_page_headers() {}
 }

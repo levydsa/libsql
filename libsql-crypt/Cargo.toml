@@ -1,0 +1,14 @@
+[package]
+name = "libsql-crypt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes = "0.8.4"
+cbc = "0.1.2"
+hmac = "0.12.1"
+sha2 = "0.10.8"
+libsql-sys.workspace = true
+libsql-wal.workspace = true
+pretty-hex = "0.4.1"
+tokio = "1.40.0"
