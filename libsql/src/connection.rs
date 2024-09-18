@@ -25,6 +25,8 @@ pub(crate) trait Conn {
 
     fn changes(&self) -> u64;
 
+    fn total_changes(&self) -> u64;
+
     fn last_insert_rowid(&self) -> i64;
 
     async fn reset(&self);
@@ -59,7 +61,7 @@ impl BatchRows {
         }
     }
 
-    #[cfg(feature = "hrana")]
+    #[cfg(any(feature = "hrana", feature = "core"))]
     pub(crate) fn new(rows: Vec<Option<Rows>>) -> Self {
         Self {
             inner: rows.into(),
@@ -123,7 +125,7 @@ impl Connection {
     ///
     /// # Return
     ///
-    /// This returns a `BatchRows` currently only the `remote` connection supports this feature and
+    /// This returns a `BatchRows` currently only the `remote`  and `local` connection supports this feature and
     /// all other connection types will return an empty set always.
     pub async fn execute_batch(&self, sql: &str) -> Result<BatchRows> {
         tracing::trace!("executing batch `{}`", sql);
@@ -134,7 +136,7 @@ impl Connection {
     ///
     /// # Return
     ///
-    /// This returns a `BatchRows` currently only the `remote` connection supports this feature and
+    /// This returns a `BatchRows` currently only the `remote` and `local` connection supports this feature and
     /// all other connection types will return an empty set always.
     pub async fn execute_transactional_batch(&self, sql: &str) -> Result<BatchRows> {
         tracing::trace!("executing batch transactional `{}`", sql);
@@ -191,6 +193,11 @@ impl Connection {
     /// Check the amount of changes the last query created.
     pub fn changes(&self) -> u64 {
         self.conn.changes()
+    }
+
+    /// Check the total amount of changes the connection has done.
+    pub fn total_changes(&self) -> u64 {
+        self.conn.total_changes()
     }
 
     /// Check the last inserted row id.

@@ -3,24 +3,41 @@ use std::os::unix::prelude::OsStrExt;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use libsql_sys::name::NamespaceResolver;
 use libsql_sys::wal::{Wal, WalManager};
 
 use crate::io::Io;
 use crate::registry::WalRegistry;
+use crate::segment::sealed::SealedSegment;
 use crate::shared_wal::SharedWal;
+use crate::storage::Storage;
 use crate::transaction::Transaction;
 
-#[derive(Clone)]
-pub struct LibsqlWalManager<FS: Io> {
-    registry: Arc<WalRegistry<FS>>,
+pub struct LibsqlWalManager<IO: Io, S> {
+    registry: Arc<WalRegistry<IO, S>>,
     next_conn_id: Arc<AtomicU64>,
+    namespace_resolver: Arc<dyn NamespaceResolver>,
 }
 
-impl<FS: Io> LibsqlWalManager<FS> {
-    pub fn new(registry: Arc<WalRegistry<FS>>) -> Self {
+impl<IO: Io, S> Clone for LibsqlWalManager<IO, S> {
+    fn clone(&self) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            next_conn_id: self.next_conn_id.clone(),
+            namespace_resolver: self.namespace_resolver.clone(),
+        }
+    }
+}
+
+impl<FS: Io, S> LibsqlWalManager<FS, S> {
+    pub fn new(
+        registry: Arc<WalRegistry<FS, S>>,
+        namespace_resolver: Arc<dyn NamespaceResolver>,
+    ) -> Self {
         Self {
             registry,
             next_conn_id: Default::default(),
+            namespace_resolver,
         }
     }
 }
@@ -32,8 +49,8 @@ pub struct LibsqlWal<FS: Io> {
     conn_id: u64,
 }
 
-impl<FS: Io> WalManager for LibsqlWalManager<FS> {
-    type Wal = LibsqlWal<FS>;
+impl<IO: Io, S: Storage<Segment = SealedSegment<IO::File>>> WalManager for LibsqlWalManager<IO, S> {
+    type Wal = LibsqlWal<IO>;
 
     fn use_shared_memory(&self) -> bool {
         false
@@ -48,10 +65,11 @@ impl<FS: Io> WalManager for LibsqlWalManager<FS> {
         db_path: &std::ffi::CStr,
     ) -> libsql_sys::wal::Result<Self::Wal> {
         let db_path = OsStr::from_bytes(&db_path.to_bytes());
+        let namespace = self.namespace_resolver.resolve(db_path.as_ref());
         let shared = self
             .registry
             .clone()
-            .open(db_path.as_ref())
+            .open(db_path.as_ref(), &namespace)
             .map_err(|e| e.into())?;
         let conn_id = self
             .next_conn_id
@@ -113,7 +131,7 @@ impl<FS: Io> Wal for LibsqlWal<FS> {
         self.last_read_frame_no = Some(tx.max_frame_no);
         self.tx = Some(Transaction::Read(tx));
 
-        tracing::debug!(invalidate_cache, "read started");
+        tracing::trace!(invalidate_cache, "read started");
         Ok(invalidate_cache)
     }
 
@@ -143,7 +161,7 @@ impl<FS: Io> Wal for LibsqlWal<FS> {
         tracing::trace!(page_no, "reading frame");
         let tx = self.tx.as_mut().unwrap();
         self.shared
-            .read_frame(tx, page_no.get(), buffer)
+            .read_page(tx, page_no.get(), buffer)
             .map_err(Into::into)?;
         Ok(())
     }
@@ -164,9 +182,9 @@ impl<FS: Io> Wal for LibsqlWal<FS> {
         match self.tx.as_mut() {
             Some(tx) => {
                 self.shared.upgrade(tx).map_err(Into::into)?;
-                tracing::debug!("write lock acquired");
+                tracing::trace!("write lock acquired");
             }
-            None => todo!("should acquire read txn first"),
+            None => panic!("should acquire read txn first"),
         }
 
         Ok(())

@@ -4,7 +4,7 @@ use tonic::metadata::errors::InvalidMetadataValueBytes;
 
 use crate::{
     auth::AuthError,
-    namespace::{ForkError, NamespaceName},
+    namespace::{configurator::fork::ForkError, NamespaceName},
     query_result_builder::QueryResultBuilderError,
 };
 
@@ -124,6 +124,8 @@ pub enum Error {
     AttachInMigration,
     #[error("join failure: {0}")]
     RuntimeTaskJoinError(#[from] tokio::task::JoinError),
+    #[error("wal error: {0}")]
+    LibsqlWal(#[from] libsql_wal::error::Error),
 }
 
 impl AsRef<Self> for Error {
@@ -218,6 +220,7 @@ impl IntoResponse for &Error {
             HasLinkedDbs(_) => self.format_err(StatusCode::BAD_REQUEST),
             AttachInMigration => self.format_err(StatusCode::BAD_REQUEST),
             RuntimeTaskJoinError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            LibsqlWal(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }
 }
@@ -286,6 +289,8 @@ pub enum LoadDumpError {
     NoTxn,
     #[error("The dump should commit the transaction.")]
     NoCommit,
+    #[error("Path is not a file")]
+    NotAFile,
 }
 
 impl ResponseError for LoadDumpError {}
@@ -303,6 +308,7 @@ impl IntoResponse for &LoadDumpError {
             | UnsupportedUrlScheme(_)
             | NoTxn
             | NoCommit
+            | NotAFile
             | DumpFilePathNotAbsolute => self.format_err(StatusCode::BAD_REQUEST),
         }
     }

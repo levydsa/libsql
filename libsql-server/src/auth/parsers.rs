@@ -1,4 +1,4 @@
-use crate::auth::{constants::GRPC_AUTH_HEADER, AuthError};
+use crate::auth::AuthError;
 
 use anyhow::{bail, Context as _, Result};
 use axum::http::HeaderValue;
@@ -41,12 +41,31 @@ pub fn parse_jwt_keys(data: &str) -> Result<Vec<jsonwebtoken::DecodingKey>> {
     }
 }
 
-pub(crate) fn parse_grpc_auth_header(metadata: &MetadataMap) -> Result<UserAuthContext, AuthError> {
-    metadata
-        .get(GRPC_AUTH_HEADER)
-        .ok_or(AuthError::AuthHeaderNotFound)
-        .and_then(|h| h.to_str().map_err(|_| AuthError::AuthHeaderNonAscii))
-        .and_then(|t| UserAuthContext::from_auth_str(t))
+pub(crate) fn parse_grpc_auth_header(
+    metadata: &MetadataMap,
+    required_fields: &Vec<&'static str>,
+) -> Result<UserAuthContext> {
+    let mut context = UserAuthContext::empty();
+
+    let mut auth_header_seen = false;
+
+    if required_fields.is_empty() {
+        return Ok(context);
+    }
+
+    for field in required_fields.iter() {
+        if let Some(h) = metadata.get(*field) {
+            let v = h.to_str().map_err(|_| AuthError::AuthHeaderNonAscii)?;
+            context.add_field(field, v.into());
+            auth_header_seen = true;
+        }
+    }
+
+    if !auth_header_seen {
+        return Err(AuthError::AuthHeaderNotFound.into());
+    }
+
+    Ok(context)
 }
 
 pub fn parse_http_auth_header<'a>(
@@ -78,6 +97,7 @@ mod tests {
     use hyper::header::AUTHORIZATION;
 
     use crate::auth::authorized::Scopes;
+    use crate::auth::constants::GRPC_AUTH_HEADER;
     use crate::auth::user_auth_strategies::jwt::Token;
     use crate::auth::{parse_http_auth_header, parse_jwt_keys, AuthError};
 
@@ -86,19 +106,26 @@ mod tests {
     #[test]
     fn parse_grpc_auth_header_returns_valid_context() {
         let mut map = tonic::metadata::MetadataMap::new();
-        map.insert("x-authorization", "bearer 123".parse().unwrap());
-        let context = parse_grpc_auth_header(&map).unwrap();
-        assert_eq!(context.scheme().as_ref().unwrap(), "bearer");
-        assert_eq!(context.token().as_ref().unwrap(), "123");
+        map.insert(GRPC_AUTH_HEADER, "bearer 123".parse().unwrap());
+        let required_fields = vec!["x-authorization".into()];
+        let context = parse_grpc_auth_header(&map, &required_fields).unwrap();
+
+        assert_eq!(
+            context.get_field("x-authorization"),
+            Some(&"bearer 123".to_string())
+        );
     }
 
     #[test]
-    fn parse_grpc_auth_header_error_no_header() {
-        let map = tonic::metadata::MetadataMap::new();
-        let result = parse_grpc_auth_header(&map);
+    fn parse_grpc_auth_header_with_multiple_required_fields() {
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert(GRPC_AUTH_HEADER, "bearer 123".parse().unwrap());
+        let required_fields = vec!["authorization".into(), "x-authorization".into()];
+        let context = parse_grpc_auth_header(&map, &required_fields).unwrap();
+
         assert_eq!(
-            result.unwrap_err().to_string(),
-            "Expected authorization header but none given"
+            context.get_field("x-authorization"),
+            Some(&"bearer 123".to_string())
         );
     }
 
@@ -106,19 +133,9 @@ mod tests {
     fn parse_grpc_auth_header_error_non_ascii() {
         let mut map = tonic::metadata::MetadataMap::new();
         map.insert("x-authorization", "bearer I❤NY".parse().unwrap());
-        let result = parse_grpc_auth_header(&map);
+        let required_fields = vec!["x-authorization".into()];
+        let result = parse_grpc_auth_header(&map, &required_fields);
         assert_eq!(result.unwrap_err().to_string(), "Non-ASCII auth header")
-    }
-
-    #[test]
-    fn parse_grpc_auth_header_error_malformed_auth_str() {
-        let mut map = tonic::metadata::MetadataMap::new();
-        map.insert("x-authorization", "bearer123".parse().unwrap());
-        let result = parse_grpc_auth_header(&map);
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Auth string does not conform to '<scheme> <token>' form"
-        )
     }
 
     #[test]

@@ -14,12 +14,16 @@ env:
   # we need to fix before we can enable this.
   # RUSTFLAGS: "-D warnings"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     runs-on: ubuntu-latest
     name: Run Checks
     env:
-      RUSTFLAGS: -D warnings
+      RUSTFLAGS: -D warnings --cfg tokio_unstable
     steps:
       - uses: hecrj/setup-rust-action@v2
 
@@ -76,15 +80,15 @@ jobs:
       - uses: taiki-e/install-action@cargo-udeps
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly hack udeps -p libsql --each-feature
-      - run: RUSTFLAGS="-D warnings" cargo check -p libsql --no-default-features --features core 
-      - run: RUSTFLAGS="-D warnings" cargo check -p libsql --no-default-features --features replication 
-      - run: RUSTFLAGS="-D warnings" cargo check -p libsql --no-default-features --features remote
+      - run: RUSTFLAGS="-D warnings --cfg tokio_unstable" cargo check -p libsql --no-default-features --features core 
+      - run: RUSTFLAGS="-D warnings --cfg tokio_unstable" cargo check -p libsql --no-default-features --features replication 
+      - run: RUSTFLAGS="-D warnings --cfg tokio_unstable" cargo check -p libsql --no-default-features --features remote
 
   test:
     runs-on: ubuntu-latest
     name: Run Tests
     env:
-      RUSTFLAGS: -D warnings
+      RUSTFLAGS: -D warnings --cfg tokio_unstable
     steps:
     - uses: hecrj/setup-rust-action@v2
 
@@ -133,7 +137,7 @@ jobs:
     - name: clean build dir
       run: rm -rf libsql-ffi/bundled/SQLite3MultipleCiphers/build
     - name: embedded replica encryption tests
-      run: cargo test -F test-encryption --package libsql-server --test tests embedded_replica
+      run: cargo xtask test-encryption
   windows:
     runs-on: windows-latest
     name: Windows checks
@@ -155,8 +159,8 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: check libsql remote
-        run: cargo check -p libsql --no-default-features -F remote
+      - name: build libsql all features
+        run: cargo build -p libsql --all-features 
 
   # test-rust-wasm:
   #   runs-on: ubuntu-latest

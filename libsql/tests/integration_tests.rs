@@ -6,6 +6,9 @@ use libsql::{
     params::{IntoParams, IntoValue},
     Connection, Database, Value,
 };
+use rand::distributions::Uniform;
+use rand::prelude::*;
+use std::collections::HashSet;
 
 async fn setup() -> Connection {
     let db = Database::open(":memory:").unwrap();
@@ -261,6 +264,48 @@ async fn connection_execute_batch_inserts() {
 }
 
 #[tokio::test]
+async fn connection_execute_batch_inserts_returning() {
+    let conn = setup().await;
+
+    conn.execute("CREATE TABLE foo(x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let mut batch_rows = conn
+        .execute_batch(
+            "BEGIN;
+            INSERT INTO foo VALUES (1) RETURNING *;
+            INSERT INTO foo VALUES (2) RETURNING *;
+            INSERT INTO foo VALUES (3) RETURNING *;
+            COMMIT;
+            ",
+        )
+        .await
+        .unwrap();
+
+    assert!(batch_rows.next_stmt_row().unwrap().is_none());
+
+    let mut rows = batch_rows.next_stmt_row().unwrap().unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+        1
+    );
+    let mut rows = batch_rows.next_stmt_row().unwrap().unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+        2
+    );
+
+    let mut rows = batch_rows.next_stmt_row().unwrap().unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+        3
+    );
+
+    assert!(batch_rows.next_stmt_row().unwrap().is_none());
+}
+
+#[tokio::test]
 async fn connection_execute_batch_newline() {
     // This test checks that we handle a null raw
     // stament in execute_batch. What happens when there
@@ -481,6 +526,17 @@ async fn blob() {
 
     let out = row.get::<Vec<u8>>(1).unwrap();
     assert_eq!(&out, &bytes);
+
+    let empty: Vec<u8> = vec![];
+    let mut rows = conn
+        .query(
+            "INSERT INTO bbb (data) VALUES (?1) RETURNING *",
+            [Value::Blob(empty.clone())],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<Vec<u8>>(1).unwrap(), empty);
 }
 
 #[tokio::test]
@@ -551,6 +607,26 @@ async fn debug_print_row() {
     );
 }
 
+#[tokio::test]
+async fn fts5_invalid_tokenizer() {
+    let db = Database::open(":memory:").unwrap();
+    let conn = db.connect().unwrap();
+    assert!(conn
+        .execute(
+            "CREATE VIRTUAL TABLE t USING fts5(s, tokenize='trigram case_sensitive ')",
+            (),
+        )
+        .await
+        .is_err());
+    assert!(conn
+        .execute(
+            "CREATE VIRTUAL TABLE t USING fts5(s, tokenize='trigram remove_diacritics ')",
+            (),
+        )
+        .await
+        .is_err());
+}
+
 #[cfg(feature = "serde")]
 #[tokio::test]
 async fn deserialize_row() {
@@ -607,4 +683,103 @@ async fn deserialize_row() {
     assert_eq!(data.none, None);
     assert_eq!(data.status, Status::Draft);
     assert_eq!(data.wrapper, Wrapper(Status::Published));
+}
+
+#[tokio::test]
+#[ignore]
+// fuzz test can be run explicitly with following command:
+// cargo test vector_fuzz_test -- --nocapture --include-ignored
+async fn vector_fuzz_test() {
+    let mut global_rng = rand::thread_rng();
+    for attempt in 0..10000 {
+        let seed = global_rng.next_u64();
+
+        let mut rng =
+            rand::rngs::StdRng::from_seed(unsafe { std::mem::transmute([seed, seed, seed, seed]) });
+        let db = Database::open(":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        let dim = rng.gen_range(1..=1536);
+        let operations = rng.gen_range(1..128);
+        println!(
+            "============== ATTEMPT {} (seed {}u64, dim {}, operations {}) ================",
+            attempt, seed, dim, operations
+        );
+
+        let _ = conn
+            .execute(
+                &format!(
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, v FLOAT32({}) )",
+                    dim
+                ),
+                (),
+            )
+            .await;
+        // println!("CREATE TABLE users (id INTEGER PRIMARY KEY, v FLOAT32({}) );", dim);
+        let _ = conn
+            .execute(
+                "CREATE INDEX users_idx ON users ( libsql_vector_idx(v) );",
+                (),
+            )
+            .await;
+        // println!("CREATE INDEX users_idx ON users ( libsql_vector_idx(v) );");
+
+        let mut next_id = 1;
+        let mut alive = HashSet::new();
+        let uniform = Uniform::new(-1.0, 1.0);
+        for _ in 0..operations {
+            let operation = rng.gen_range(0..4);
+            let vector: Vec<f32> = (0..dim).map(|_| rng.sample(uniform)).collect();
+            let vector_str = format!(
+                "[{}]",
+                vector
+                    .iter()
+                    .map(|x| format!("{}", x))
+                    .collect::<Vec<String>>()
+                    .join(",")
+            );
+            if operation == 0 {
+                // println!("INSERT INTO users VALUES ({}, vector('{}') );", next_id, vector_str);
+                conn.execute(
+                    "INSERT INTO users VALUES (?, vector(?) )",
+                    libsql::params![next_id, vector_str],
+                )
+                .await
+                .unwrap();
+                alive.insert(next_id);
+                next_id += 1;
+            } else if operation == 1 {
+                let id = rng.gen_range(0..next_id);
+                // println!("DELETE FROM users WHERE id = {};", id);
+                conn.execute("DELETE FROM users WHERE id = ?", libsql::params![id])
+                    .await
+                    .unwrap();
+                alive.remove(&id);
+            } else if operation == 2 && !alive.is_empty() {
+                let id = alive.iter().collect::<Vec<_>>()[rng.gen_range(0..alive.len())];
+                // println!("UPDATE users SET v = vector('{}') WHERE id = {};", vector_str, id);
+                conn.execute(
+                    "UPDATE users SET v = vector(?) WHERE id = ?",
+                    libsql::params![vector_str, id],
+                )
+                .await
+                .unwrap();
+            } else if operation == 3 {
+                let k = rng.gen_range(1..200);
+                // println!("SELECT * FROM vector_top_k('users_idx', '{}', {});", vector_str, k);
+                let result = conn
+                    .query(
+                        "SELECT * FROM vector_top_k('users_idx', ?, ?)",
+                        libsql::params![vector_str, k],
+                    )
+                    .await
+                    .unwrap();
+                let count = result.into_stream().count().await;
+                assert!(count <= alive.len());
+                if alive.len() > 0 {
+                    assert!(count > 0);
+                }
+            }
+        }
+        let _ = conn.execute("REINDEX users;", ()).await.unwrap();
+    }
 }

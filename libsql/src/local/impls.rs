@@ -5,7 +5,7 @@ use crate::connection::BatchRows;
 use crate::{
     connection::Conn,
     params::Params,
-    rows::{RowInner, RowsInner},
+    rows::{ColumnsInner, RowInner, RowsInner},
     statement::Stmt,
     transaction::Tx,
     Column, Connection, Result, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
@@ -24,8 +24,7 @@ impl Conn for LibsqlConnection {
     }
 
     async fn execute_batch(&self, sql: &str) -> Result<BatchRows> {
-        self.conn.execute_batch(sql)?;
-        Ok(BatchRows::empty())
+        self.conn.execute_batch(sql)
     }
 
     async fn execute_transactional_batch(&self, sql: &str) -> Result<BatchRows> {
@@ -61,6 +60,10 @@ impl Conn for LibsqlConnection {
 
     fn changes(&self) -> u64 {
         self.conn.changes()
+    }
+
+    fn total_changes(&self) -> u64 {
+        self.conn.total_changes()
     }
 
     fn last_insert_rowid(&self) -> i64 {
@@ -106,6 +109,13 @@ impl Stmt for LibsqlStmt {
         stmt.query(&params).map(LibsqlRows).map(Rows::new)
     }
 
+    async fn run(&mut self, params: &Params) -> Result<()> {
+        let params = params.clone();
+        let stmt = self.0.clone();
+
+        stmt.run(&params)
+    }
+
     fn reset(&mut self) {
         self.0.reset();
     }
@@ -149,7 +159,9 @@ impl RowsInner for LibsqlRows {
 
         Ok(row)
     }
+}
 
+impl ColumnsInner for LibsqlRows {
     fn column_count(&self) -> i32 {
         self.0.column_count()
     }
@@ -170,20 +182,22 @@ impl RowInner for LibsqlRow {
         self.0.get_value(idx)
     }
 
-    fn column_name(&self, idx: i32) -> Option<&str> {
-        self.0.column_name(idx)
-    }
-
     fn column_str(&self, idx: i32) -> Result<&str> {
         self.0.get::<&str>(idx)
+    }
+}
+
+impl ColumnsInner for LibsqlRow {
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.0.column_name(idx)
     }
 
     fn column_type(&self, idx: i32) -> Result<ValueType> {
         self.0.column_type(idx).map(ValueType::from)
     }
 
-    fn column_count(&self) -> usize {
-        self.0.stmt.column_count()
+    fn column_count(&self) -> i32 {
+        self.0.stmt.column_count() as i32
     }
 }
 

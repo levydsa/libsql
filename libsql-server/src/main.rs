@@ -1,6 +1,7 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
@@ -8,11 +9,12 @@ use bytesize::ByteSize;
 use clap::Parser;
 use hyper::client::HttpConnector;
 use libsql_server::auth::{parse_http_basic_auth_arg, parse_jwt_keys, user_auth_strategies, Auth};
+use libsql_server::wal_toolkit::{S3Args, WalToolkit};
 use tokio::sync::Notify;
 use tokio::time::Duration;
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 use libsql_server::config::{
     AdminApiConfig, BottomlessConfig, DbConfig, HeartbeatConfig, MetaStoreConfig, RpcClientConfig,
@@ -42,6 +44,8 @@ struct Cli {
 
     #[clap(long, default_value = "127.0.0.1:8080", env = "SQLD_HTTP_LISTEN_ADDR")]
     http_listen_addr: SocketAddr,
+
+    /// Enable a web-based http console served at the /console route.
     #[clap(long)]
     enable_http_console: bool,
 
@@ -144,7 +148,7 @@ struct Cli {
     #[clap(long, env = "SQLD_HEARTBEAT_URL")]
     heartbeat_url: Option<String>,
 
-    /// The HTTP "Authornization" header to include in the a server heartbeat
+    /// The HTTP "Authorization" header to include in the a server heartbeat
     /// `POST` request.
     /// By default, the server doesn't send a heartbeat.
     #[clap(long, env = "SQLD_HEARTBEAT_AUTH")]
@@ -181,7 +185,7 @@ struct Cli {
     #[clap(long, env = "SQLD_CHECKPOINT_INTERVAL_S")]
     checkpoint_interval_s: Option<u64>,
 
-    /// By default, all request for which a namespace can't be determined fallaback to the default
+    /// By default, all request for which a namespace can't be determined fallback to the default
     /// namespace `default`. This flag disables that.
     #[clap(long)]
     disable_default_namespace: bool,
@@ -227,6 +231,13 @@ struct Cli {
     #[clap(long, env = "SQLD_META_STORE_BUCKET_ENDPOINT")]
     meta_store_bucket_endpoint: Option<String>,
 
+    #[clap(
+        long,
+        env = "SQLD_META_STORE_DESTROY_ON_ERROR",
+        default_value = "false"
+    )]
+    meta_store_destroy_on_error: bool,
+
     /// encryption_key for encryption at rest
     #[clap(long, env = "SQLD_ENCRYPTION_KEY")]
     encryption_key: Option<bytes::Bytes>,
@@ -255,16 +266,65 @@ struct Cli {
         default_value = "http://0.0.0.0:5002"
     )]
     storage_server_address: String,
+
+    /// Enable bottomless to libsql_wal migration. Bottomless replication must be enabled.
+    #[clap(
+        long,
+        env = "LIBSQL_MIGRATE_BOTTOMLESS",
+        requires = "enable_bottomless_replication"
+    )]
+    migrate_bottomless: bool,
+
+    /// Enables the main runtime deadlock monitor: if the main runtime deadlocks, logs an error
+    #[clap(long)]
+    enable_deadlock_monitor: bool,
+
+    /// Auth key for the admin API
+    #[clap(long, env = "LIBSQL_ADMIN_AUTH_KEY", requires = "admin_listen_addr")]
+    admin_auth_key: Option<String>,
+
+    /// Whether to perform a sync of all namespaces with remote on startup
+    #[clap(
+        long,
+        env = "LIBSQL_SYNC_FROM_STORAGE",
+        requires = "enable_bottomless_replication"
+    )]
+    sync_from_storage: bool,
+    /// Whether to force loading all WAL at startup, with libsql-wal
+    /// By default, WALs are loaded lazily, as the databases are openned.
+    /// Whether to force loading all wal at startup
+    #[clap(long)]
+    force_load_wals: bool,
+    /// Sync conccurency
+    #[clap(
+        long,
+        env = "LIBSQL_SYNC_CONCCURENCY",
+        requires = "sync_from_storage",
+        default_value = "8"
+    )]
+    sync_conccurency: usize,
+
+    #[clap(subcommand)]
+    subcommand: Option<UtilsSubcommands>,
 }
 
 #[derive(clap::Subcommand, Debug)]
 enum UtilsSubcommands {
-    Dump {
+    AdminShell {
+        #[clap(long, default_value = "http://127.0.0.1:9090")]
+        admin_api_url: String,
         #[clap(long)]
-        /// Path at which to write the dump
-        path: Option<PathBuf>,
+        namespace: Option<String>,
         #[clap(long)]
-        namespace: String,
+        auth: Option<String>,
+    },
+    WalToolkit {
+        #[arg(long, short, default_value = ".compactor")]
+        path: PathBuf,
+        #[clap(flatten)]
+        s3_args: S3Args,
+        #[clap(subcommand)]
+        command: WalToolkit,
     },
 }
 
@@ -447,6 +507,7 @@ async fn make_admin_api_config(config: &Cli) -> anyhow::Result<Option<AdminApiCo
                 acceptor,
                 connector,
                 disable_metrics: false,
+                auth_key: config.admin_auth_key.clone(),
             }))
         }
         None => Ok(None),
@@ -586,10 +647,14 @@ fn make_meta_store_config(config: &Cli) -> anyhow::Result<MetaStoreConfig> {
     Ok(MetaStoreConfig {
         bottomless,
         allow_recover_from_fs: config.allow_metastore_recovery,
+        destroy_on_error: config.meta_store_destroy_on_error,
     })
 }
 
-async fn build_server(config: &Cli) -> anyhow::Result<Server> {
+async fn build_server(
+    config: &Cli,
+    set_log_level: impl Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static,
+) -> anyhow::Result<Server> {
     let db_config = make_db_config(config)?;
     let user_api_config = make_user_api_config(config).await?;
     let admin_api_config = make_admin_api_config(config).await?;
@@ -617,6 +682,16 @@ async fn build_server(config: &Cli) -> anyhow::Result<Server> {
         }
     });
 
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_or_http()
+        .enable_all_versions()
+        .wrap_connector(http);
+
     Ok(Server {
         path: config.db_path.clone().into(),
         db_config,
@@ -641,11 +716,47 @@ async fn build_server(config: &Cli) -> anyhow::Result<Server> {
             .unwrap_or(Duration::from_secs(30)),
         use_custom_wal: config.use_custom_wal,
         storage_server_address: config.storage_server_address.clone(),
+        connector: Some(https),
+        migrate_bottomless: config.migrate_bottomless,
+        enable_deadlock_monitor: config.enable_deadlock_monitor,
+        should_sync_from_storage: config.sync_from_storage,
+        force_load_wals: config.force_load_wals,
+        sync_conccurency: config.sync_conccurency,
+        set_log_level: Some(Box::new(set_log_level)),
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Cli::parse();
+
+    if let Some(ref subcommand) = args.subcommand {
+        match subcommand {
+            UtilsSubcommands::AdminShell {
+                admin_api_url,
+                namespace,
+                auth,
+            } => {
+                let client = libsql_server::admin_shell::AdminShellClient::new(
+                    admin_api_url.clone(),
+                    auth.clone(),
+                );
+                if let Some(ns) = namespace {
+                    client.run_namespace(ns).await?;
+                }
+            }
+            UtilsSubcommands::WalToolkit {
+                command,
+                path,
+                s3_args,
+            } => {
+                command.run(path, s3_args).await?;
+            }
+        }
+
+        return Ok(());
+    }
+
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
@@ -658,18 +769,24 @@ async fn main() -> Result<()> {
     #[cfg(feature = "debug-tools")]
     enable_libsql_logging();
 
+    let (filter, reload_handle) =
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::from_default_env());
+    let set_log_level = move |s: &str| -> anyhow::Result<()> {
+        let filter = EnvFilter::from_str(s.trim())?;
+        reload_handle.reload(filter)?;
+        Ok(())
+    };
+
     registry
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+                .with_filter(filter),
         )
         .init();
 
-    let args = Cli::parse();
-
     args.print_welcome_message();
-    let server = build_server(&args).await?;
+    let server = build_server(&args, set_log_level).await?;
     server.start().await?;
 
     Ok(())

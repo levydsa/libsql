@@ -10,6 +10,7 @@ use tonic::metadata::BinaryMetadataValue;
 
 use crate::auth::Authenticated;
 use crate::error::Error;
+use crate::http::user::timing::sample_time;
 use crate::metrics::{
     CONCURRENT_CONNECTIONS_COUNT, CONNECTION_ALIVE_DURATION, CONNECTION_CREATE_TIME,
 };
@@ -24,8 +25,10 @@ use crate::Result;
 use self::program::{Cond, DescribeResponse, Program, Step};
 
 pub mod config;
+mod connection_core;
 pub mod connection_manager;
 pub mod dump;
+pub mod legacy;
 pub mod libsql;
 pub mod program;
 pub mod write_proxy;
@@ -169,6 +172,8 @@ pub trait Connection: Send + Sync + 'static {
     async fn vacuum_if_needed(&self) -> Result<()>;
 
     fn diagnostics(&self) -> String;
+
+    fn with_raw<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R;
 }
 
 fn make_batch_program(batch: Vec<Query>) -> Vec<Step> {
@@ -310,6 +315,13 @@ impl<F> MakeThrottledConnection<F> {
             1
         }
     }
+
+    pub async fn untracked(&self) -> Result<F::Connection, Error>
+    where
+        F: MakeConnection,
+    {
+        self.connection_maker.create().await
+    }
 }
 
 struct WaitersGuard<'a> {
@@ -387,6 +399,7 @@ pub struct TrackedConnection<DB> {
 
 impl<T> Drop for TrackedConnection<T> {
     fn drop(&mut self) {
+        sample_time("connection-duration", self.created_at.elapsed());
         CONCURRENT_CONNECTIONS_COUNT.decrement(1.0);
         CONNECTION_ALIVE_DURATION.record(self.created_at.elapsed());
     }
@@ -444,6 +457,10 @@ impl<DB: Connection> Connection for TrackedConnection<DB> {
     fn diagnostics(&self) -> String {
         self.inner.diagnostics()
     }
+
+    fn with_raw<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
+        self.inner.with_raw(f)
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +505,10 @@ pub mod test {
 
         fn diagnostics(&self) -> String {
             "dummy".into()
+        }
+
+        fn with_raw<R>(&self, _f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
+            todo!()
         }
     }
 

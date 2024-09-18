@@ -24,7 +24,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::rows::{RowInner, RowsInner};
+use super::rows::{ColumnsInner, RowInner, RowsInner};
 
 pub(crate) type Result<T> = std::result::Result<T, HranaError>;
 
@@ -159,6 +159,14 @@ where
         Ok(result.affected_row_count as usize)
     }
 
+    pub async fn run(&mut self, params: &Params) -> crate::Result<()> {
+        let mut stmt = self.inner.clone();
+        bind_params(params.clone(), &mut stmt);
+
+        let _ = self.stream.execute_inner(stmt, self.close_stream).await?;
+        Ok(())
+    }
+
     pub(crate) async fn query_raw(
         &mut self,
         params: &Params,
@@ -253,7 +261,12 @@ where
     async fn next(&mut self) -> crate::Result<Option<super::Row>> {
         self.next().await
     }
+}
 
+impl<S> ColumnsInner for HranaRows<S>
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin,
+{
     fn column_count(&self) -> i32 {
         self.column_count()
     }
@@ -295,13 +308,6 @@ impl RowInner for Row {
         Ok(into_value2(v))
     }
 
-    fn column_name(&self, idx: i32) -> Option<&str> {
-        self.cols
-            .get(idx as usize)
-            .and_then(|c| c.name.as_ref())
-            .map(|s| s.as_str())
-    }
-
     fn column_str(&self, idx: i32) -> crate::Result<&str> {
         if let Some(value) = self.inner.get(idx as usize) {
             if let proto::Value::Text { value } = value {
@@ -312,6 +318,15 @@ impl RowInner for Row {
         } else {
             Err(crate::Error::ColumnNotFound(idx))
         }
+    }
+}
+
+impl ColumnsInner for Row {
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.cols
+            .get(idx as usize)
+            .and_then(|c| c.name.as_ref())
+            .map(|s| s.as_str())
     }
 
     fn column_type(&self, idx: i32) -> crate::Result<ValueType> {
@@ -329,8 +344,8 @@ impl RowInner for Row {
         }
     }
 
-    fn column_count(&self) -> usize {
-        self.cols.len()
+    fn column_count(&self) -> i32 {
+        self.cols.len() as i32
     }
 }
 
@@ -409,7 +424,9 @@ impl RowsInner for StmtResultRows {
             inner: Box::new(row),
         }))
     }
+}
 
+impl ColumnsInner for StmtResultRows {
     fn column_count(&self) -> i32 {
         self.cols.len() as i32
     }

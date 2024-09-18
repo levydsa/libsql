@@ -139,6 +139,7 @@ impl StmtKind {
                 ))
             }
             Cmd::Stmt(Stmt::Detach(_)) => Some(Self::Detach),
+            Cmd::Stmt(Stmt::Reindex { .. }) => Some(Self::Write),
             _ => None,
         }
     }
@@ -404,6 +405,14 @@ impl Statement {
             self.kind,
             StmtKind::Read | StmtKind::TxnEnd | StmtKind::TxnBegin
         )
+    }
+
+    pub(crate) fn is_pragma(&self) -> bool {
+        // adding a flag to the program would break the serialization, so we do that instead
+        match self.stmt.split_whitespace().next() {
+            Some(s) => s.trim().eq_ignore_ascii_case("pragma"),
+            None => false,
+        }
     }
 }
 

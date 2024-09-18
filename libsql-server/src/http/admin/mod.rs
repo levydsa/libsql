@@ -1,25 +1,29 @@
 use anyhow::Context as _;
+use axum::body::StreamBody;
 use axum::extract::{FromRef, Path, State};
+use axum::middleware::Next;
 use axum::routing::delete;
 use axum::Json;
 use chrono::NaiveDateTime;
-use futures::TryStreamExt;
-use hyper::{Body, Request};
+use futures::{SinkExt, StreamExt, TryStreamExt};
+use hyper::{Body, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::cell::OnceCell;
+use std::convert::Infallible;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{CopyToBytes, ReaderStream, SinkWriter};
+use tokio_util::sync::PollSender;
 use tower_http::trace::DefaultOnResponse;
 use url::Url;
 
 use crate::auth::parse_jwt_keys;
-use crate::connection::config::DatabaseConfig;
+use crate::connection::config::{DatabaseConfig, DurabilityMode};
 use crate::error::{Error, LoadDumpError};
 use crate::hrana;
 use crate::namespace::{DumpStream, NamespaceName, NamespaceStore, RestoreOption};
@@ -44,6 +48,7 @@ struct AppState<C> {
     user_http_server: Arc<hrana::http::Server>,
     connector: C,
     metrics: Metrics,
+    set_env_filter: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Sync + Send + 'static>>,
 }
 
 impl<C> FromRef<Arc<AppState<C>>> for Metrics {
@@ -61,6 +66,8 @@ pub async fn run<A, C>(
     connector: C,
     disable_metrics: bool,
     shutdown: Arc<Notify>,
+    auth: Option<Arc<str>>,
+    set_env_filter: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Sync + Send + 'static>>,
 ) -> anyhow::Result<()>
 where
     A: crate::net::Accept,
@@ -90,9 +97,29 @@ where
 
         tokio::task::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let runtime = tokio::runtime::Handle::current();
+                let metrics = runtime.metrics();
+                crate::metrics::TOKIO_RUNTIME_BLOCKING_QUEUE_DEPTH
+                    .set(metrics.blocking_queue_depth() as f64);
+                crate::metrics::TOKIO_RUNTIME_INJECTION_QUEUE_DEPTH
+                    .set(metrics.injection_queue_depth() as f64);
+                crate::metrics::TOKIO_RUNTIME_NUM_BLOCKING_THREADS
+                    .set(metrics.num_blocking_threads() as f64);
+                crate::metrics::TOKIO_RUNTIME_NUM_IDLE_BLOCKING_THREADS
+                    .set(metrics.num_idle_blocking_threads() as f64);
+                crate::metrics::TOKIO_RUNTIME_NUM_WORKERS.set(metrics.num_workers() as f64);
+
+                crate::metrics::TOKIO_RUNTIME_IO_DRIVER_FD_DEREGISTERED_COUNT
+                    .absolute(metrics.io_driver_fd_deregistered_count() as u64);
+                crate::metrics::TOKIO_RUNTIME_IO_DRIVER_FD_REGISTERED_COUNT
+                    .absolute(metrics.io_driver_fd_registered_count() as u64);
+                crate::metrics::TOKIO_RUNTIME_IO_DRIVER_READY_COUNT
+                    .absolute(metrics.io_driver_ready_count() as u64);
+                crate::metrics::TOKIO_RUNTIME_REMOTE_SCHEDULE_COUNT
+                    .absolute(metrics.remote_schedule_count() as u64);
 
                 crate::metrics::SERVER_COUNT.set(1.0);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
 
@@ -139,11 +166,16 @@ where
         )
         .route("/v1/diagnostics", get(handle_diagnostics))
         .route("/metrics", get(handle_metrics))
+        .route("/profile/heap/enable", post(enable_profile_heap))
+        .route("/profile/heap/disable/:id", post(disable_profile_heap))
+        .route("/profile/heap/:id", delete(delete_profile_heap))
+        .route("/log-filter", post(handle_set_log_filter))
         .with_state(Arc::new(AppState {
-            namespaces,
+            namespaces: namespaces.clone(),
             connector,
             user_http_server,
             metrics,
+            set_env_filter,
         }))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
@@ -155,6 +187,16 @@ where
                 ),
         );
 
+    let admin_shell = crate::admin_shell::make_svc(namespaces.clone());
+    let grpc_router = tonic::transport::Server::builder()
+        .accept_http1(true)
+        .add_service(tonic_web::enable(admin_shell))
+        .into_router();
+
+    let router = router
+        .merge(grpc_router)
+        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware));
+
     hyper::server::Server::builder(acceptor)
         .serve(router.into_make_service())
         .with_graceful_shutdown(shutdown.notified())
@@ -162,6 +204,34 @@ where
         .context("Could not bind admin HTTP API server")?;
 
     Ok(())
+}
+
+async fn auth_middleware<B>(
+    State(auth): State<Option<Arc<str>>>,
+    request: Request<B>,
+    next: Next<B>,
+) -> Result<axum::response::Response, StatusCode> {
+    if let Some(ref auth) = auth {
+        let Some(auth_header) = request.headers().get("authorization") else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let Ok(auth_str) = std::str::from_utf8(auth_header.as_bytes()) else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+
+        let mut split = auth_str.split_whitespace();
+        match split.next() {
+            Some(s) if s.trim().eq_ignore_ascii_case("basic") => (),
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+
+        match split.next() {
+            Some(s) if s.trim() == auth.as_ref() => (),
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
+    Ok(next.run(request).await)
 }
 
 async fn handle_get_index() -> &'static str {
@@ -191,8 +261,8 @@ async fn handle_get_config<C: Connector>(
         jwt_key: config.jwt_key.clone(),
         allow_attach: config.allow_attach,
         txn_timeout_s: config.txn_timeout.map(|d| d.as_secs() as u64),
+        durability_mode: Some(config.durability_mode),
     };
-
     Ok(Json(resp))
 }
 
@@ -239,6 +309,8 @@ struct HttpDatabaseConfig {
     allow_attach: bool,
     #[serde(default)]
     txn_timeout_s: Option<u64>,
+    #[serde(default)]
+    durability_mode: Option<DurabilityMode>,
 }
 
 async fn handle_post_config<C>(
@@ -267,6 +339,9 @@ async fn handle_post_config<C>(
         config.heartbeat_url = Some(Url::parse(&url)?);
     }
     config.jwt_key = req.jwt_key;
+    if let Some(mode) = req.durability_mode {
+        config.durability_mode = mode;
+    }
 
     store.store(config).await?;
 
@@ -290,6 +365,8 @@ struct CreateNamespaceReq {
     shared_schema_name: Option<NamespaceName>,
     #[serde(default)]
     allow_attach: bool,
+    #[serde(default)]
+    durability_mode: Option<DurabilityMode>,
 }
 
 async fn handle_create_namespace<C: Connector>(
@@ -318,7 +395,7 @@ async fn handle_create_namespace<C: Connector>(
             ));
         }
         // TODO: move this check into meta store
-        if !app_state.namespaces.exists(&ns) {
+        if !app_state.namespaces.exists(&ns).await {
             return Err(Error::NamespaceDoesntExist(ns.to_string()));
         }
 
@@ -341,6 +418,7 @@ async fn handle_create_namespace<C: Connector>(
     if let Some(max_db_size) = req.max_db_size {
         config.max_db_pages = max_db_size.as_u64() / LIBSQL_PAGE_SIZE;
     }
+    config.durability_mode = req.durability_mode.unwrap_or(DurabilityMode::default());
 
     app_state.namespaces.create(namespace, dump, config).await?;
 
@@ -403,6 +481,10 @@ where
                 return Err(LoadDumpError::DumpFileDoesntExist);
             }
 
+            if !path.is_file() {
+                return Err(LoadDumpError::NotAFile);
+            }
+
             let f = tokio::fs::File::open(path).await?;
 
             Ok(Box::new(ReaderStream::new(f)))
@@ -434,10 +516,80 @@ async fn handle_delete_namespace<C>(
     Ok(())
 }
 
+async fn handle_set_log_filter<C>(
+    State(app_state): State<Arc<AppState<C>>>,
+    body: String,
+) -> crate::Result<()> {
+    if let Some(ref cb) = app_state.set_env_filter {
+        cb(&body)?;
+    }
+    Ok(())
+}
+
 async fn handle_checkpoint<C>(
     State(app_state): State<Arc<AppState<C>>>,
     Path(namespace): Path<NamespaceName>,
 ) -> crate::Result<()> {
     app_state.namespaces.checkpoint(namespace).await?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct EnableHeapProfileRequest {
+    #[serde(default)]
+    max_stack_depth: Option<usize>,
+    #[serde(default)]
+    max_trackers: Option<usize>,
+    #[serde(default)]
+    tracker_event_buffer_size: Option<usize>,
+    #[serde(default)]
+    sample_rate: Option<f64>,
+}
+
+async fn enable_profile_heap(Json(req): Json<EnableHeapProfileRequest>) -> crate::Result<String> {
+    let path = tokio::task::spawn_blocking(move || {
+        rheaper::enable_tracking(rheaper::TrackerConfig {
+            max_stack_depth: req.max_stack_depth.unwrap_or(30),
+            max_trackers: req.max_trackers.unwrap_or(200),
+            tracker_event_buffer_size: req.tracker_event_buffer_size.unwrap_or(5_000),
+            sample_rate: req.sample_rate.unwrap_or(1.0),
+            profile_dir: PathBuf::from("heap_profile"),
+        })
+        .map_err(|e| crate::Error::Anyhow(anyhow::anyhow!("{e}")))
+    })
+    .await??;
+
+    Ok(path.file_name().unwrap().to_str().unwrap().to_string())
+}
+
+async fn disable_profile_heap(Path(profile): Path<String>) -> impl axum::response::IntoResponse {
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+    tokio::task::spawn_blocking(move || {
+        rheaper::disable_tracking();
+        let profile_dir = PathBuf::from("heap_profile").join(&profile);
+        let sink =
+            PollSender::new(tx).sink_map_err(|_| std::io::Error::from(ErrorKind::BrokenPipe));
+        let writer = tokio_util::io::SyncIoBridge::new(SinkWriter::new(CopyToBytes::new(sink)));
+        let mut builder = tar::Builder::new(writer);
+        if let Err(e) = builder.append_dir_all(&profile, &profile_dir) {
+            tracing::error!("io error sending trace: {e}");
+            return;
+        }
+        if let Err(e) = builder.finish() {
+            tracing::error!("io error sending trace: {e}");
+            return;
+        }
+    });
+
+    let stream =
+        tokio_stream::wrappers::ReceiverStream::new(rx).map(|b| Result::<_, Infallible>::Ok(b));
+    let body = StreamBody::new(stream);
+
+    body
+}
+
+async fn delete_profile_heap(Path(profile): Path<String>) -> crate::Result<()> {
+    let profile_dir = PathBuf::from("heap_profile").join(&profile);
+    tokio::fs::remove_dir_all(&profile_dir).await?;
     Ok(())
 }

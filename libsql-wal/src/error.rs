@@ -11,6 +11,24 @@ pub enum Error {
     BusySnapshot,
     #[error("invalid segment header checksum")]
     InvalidHeaderChecksum,
+    #[error("invalid segment header magic")]
+    InvalidHeaderMagic,
+    #[error("invalid segment header version")]
+    InvalidHeaderVersion,
+    #[error("Invalid page size, only 4095 is supported")]
+    InvalidPageSize,
+    #[error("Registry is shutting down")]
+    ShuttingDown,
+
+    #[error("invalid db footer magic")]
+    InvalidFooterMagic,
+    #[error("invalid db footer version")]
+    InvalidFooterVersion,
+
+    #[error("storage error: {0}")]
+    Storage(#[from] Box<crate::storage::Error>),
+    #[error("wal is being deleted")]
+    DeletingWal,
 }
 
 impl Into<libsql_sys::ffi::Error> for Error {

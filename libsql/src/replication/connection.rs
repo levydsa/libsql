@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-
+use std::sync::atomic::AtomicU64;
 use libsql_replication::rpc::proxy::{
     describe_result, query_result::RowResult, Cond, DescribeResult, ExecuteResults, NotCond,
     OkCond, Positional, Query, ResultRows, State as RemoteState, Step,
@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 
 use crate::parser;
 use crate::parser::StmtKind;
-use crate::rows::{RowInner, RowsInner};
+use crate::rows::{ColumnsInner, RowInner, RowsInner};
 use crate::statement::Stmt;
 use crate::transaction::Tx;
 use crate::{
@@ -28,12 +28,14 @@ pub struct RemoteConnection {
     pub(self) local: LibsqlConnection,
     writer: Option<Writer>,
     inner: Arc<Mutex<Inner>>,
+    max_write_replication_index: Arc<AtomicU64>,
 }
 
 #[derive(Default, Debug)]
 struct Inner {
     state: State,
     changes: u64,
+    total_changes: u64,
     last_insert_rowid: i64,
 }
 
@@ -165,12 +167,25 @@ impl From<RemoteState> for State {
 }
 
 impl RemoteConnection {
-    pub(crate) fn new(local: LibsqlConnection, writer: Option<Writer>) -> Self {
+    pub(crate) fn new(local: LibsqlConnection, writer: Option<Writer>, max_write_replication_index: Arc<AtomicU64>) -> Self {
         let state = Arc::new(Mutex::new(Inner::default()));
         Self {
             local,
             writer,
             inner: state,
+            max_write_replication_index,
+        }
+    }
+
+    fn update_max_write_replication_index(&self, index: Option<u64>) {
+        if let Some(index) = index {
+            let mut current = self.max_write_replication_index.load(std::sync::atomic::Ordering::SeqCst);
+            while index > current {
+                match self.max_write_replication_index.compare_exchange(current, index, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(new_current) => current = new_current,
+                }
+            }
         }
     }
 
@@ -200,6 +215,8 @@ impl RemoteConnection {
                 .into();
         }
 
+        self.update_max_write_replication_index(res.current_frame_no);
+
         if let Some(replicator) = writer.replicator() {
             replicator.sync_oneshot().await?;
         }
@@ -224,6 +241,8 @@ impl RemoteConnection {
                 .expect("Invalid state enum")
                 .into();
         }
+
+        self.update_max_write_replication_index(res.current_frame_no);
 
         if let Some(replicator) = writer.replicator() {
             replicator.sync_oneshot().await?;
@@ -253,6 +272,7 @@ impl RemoteConnection {
             state.last_insert_rowid = *rowid;
         }
 
+        state.total_changes += row.affected_row_count;
         state.changes = row.affected_row_count;
     }
 
@@ -491,6 +511,10 @@ impl Conn for RemoteConnection {
         self.inner.lock().changes
     }
 
+    fn total_changes(&self) -> u64 {
+        self.inner.lock().total_changes
+    }
+
     fn last_insert_rowid(&self) -> i64 {
         self.inner.lock().last_insert_rowid
     }
@@ -676,6 +700,33 @@ impl Stmt for RemoteStatement {
         Ok(Rows::new(RemoteRows(rows, 0)))
     }
 
+    async fn run(&mut self, params: &Params) -> Result<()> {
+        if let Some(stmt) = &mut self.local_statement {
+            return stmt.run(params.clone()).await;
+        }
+
+        let res = self
+            .conn
+            .execute_remote(self.stmts.clone(), params.clone())
+            .await?;
+
+        for result in res.results {
+            match result.row_result {
+                Some(RowResult::Row(row)) => self.conn.update_state(&row),
+                Some(RowResult::Error(e)) => {
+                    return Err(Error::RemoteSqliteFailure(
+                        e.code,
+                        e.extended_code,
+                        e.message,
+                    ))
+                }
+                None => panic!("unexpected empty result row"),
+            };
+        }
+
+        Ok(())
+    }
+
     fn reset(&mut self) {}
 
     fn parameter_count(&self) -> usize {
@@ -747,7 +798,9 @@ impl RowsInner for RemoteRows {
         let row = RemoteRow(values, self.0.column_descriptions.clone());
         Ok(Some(row).map(Box::new).map(|inner| Row { inner }))
     }
+}
 
+impl ColumnsInner for RemoteRows {
     fn column_count(&self) -> i32 {
         self.0.column_descriptions.len() as i32
     }
@@ -780,10 +833,6 @@ impl RowInner for RemoteRow {
             .ok_or(Error::InvalidColumnIndex)
     }
 
-    fn column_name(&self, idx: i32) -> Option<&str> {
-        self.1.get(idx as usize).map(|s| s.name.as_str())
-    }
-
     fn column_str(&self, idx: i32) -> Result<&str> {
         let value = self.0.get(idx as usize).ok_or(Error::InvalidColumnIndex)?;
 
@@ -791,6 +840,12 @@ impl RowInner for RemoteRow {
             Value::Text(s) => Ok(s.as_str()),
             _ => Err(Error::InvalidColumnType),
         }
+    }
+}
+
+impl ColumnsInner for RemoteRow {
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.1.get(idx as usize).map(|s| s.name.as_str())
     }
 
     fn column_type(&self, idx: i32) -> Result<ValueType> {
@@ -802,8 +857,8 @@ impl RowInner for RemoteRow {
             .ok_or(Error::InvalidColumnType)
     }
 
-    fn column_count(&self) -> usize {
-        self.1.len()
+    fn column_count(&self) -> i32 {
+        self.1.len() as i32
     }
 }
 

@@ -6,11 +6,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::common::auth::encode;
 use crate::common::http::Client;
 use crate::common::net::{init_tracing, SimServer, TestServer, TurmoilAcceptor, TurmoilConnector};
-use crate::common::snapshot_metrics;
+use crate::common::{self, snapshot_metrics};
 use libsql::Database;
-use libsql_server::config::{AdminApiConfig, DbConfig, RpcServerConfig, UserApiConfig};
+use libsql_server::auth::{user_auth_strategies, Auth};
+use libsql_server::config::{
+    AdminApiConfig, DbConfig, RpcClientConfig, RpcServerConfig, UserApiConfig,
+};
 use serde_json::json;
 use tempfile::tempdir;
 use tokio::sync::Notify;
@@ -51,6 +55,7 @@ fn make_primary(sim: &mut Sim, path: PathBuf) {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                     connector: TurmoilConnector,
                     disable_metrics: false,
+                    auth_key: None,
                 }),
                 rpc_server_config: Some(RpcServerConfig {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
@@ -98,7 +103,7 @@ fn embedded_replica() {
         )
         .await?;
 
-        let n = db.sync().await?;
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, None);
 
         let conn = db.connect()?;
@@ -106,7 +111,7 @@ fn embedded_replica() {
         conn.execute("CREATE TABLE user (id INTEGER NOT NULL PRIMARY KEY)", ())
             .await?;
 
-        let n = db.sync().await?;
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, Some(1));
 
         let err = conn
@@ -171,7 +176,7 @@ fn execute_batch() {
         )
         .await?;
 
-        let n = db.sync().await?;
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, None);
 
         let conn = db.connect()?;
@@ -179,7 +184,9 @@ fn execute_batch() {
         conn.execute("CREATE TABLE user (id INTEGER NOT NULL PRIMARY KEY)", ())
             .await?;
 
-        let n = db.sync().await?;
+        assert_eq!(db.max_write_replication_index(), Some(1));
+
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, Some(1));
 
         conn.execute_batch(
@@ -224,15 +231,16 @@ fn stream() {
         )
         .await?;
 
-        let n = db.sync().await?;
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, None);
 
         let conn = db.connect()?;
 
         conn.execute("CREATE TABLE user (id INTEGER NOT NULL PRIMARY KEY)", ())
             .await?;
+        assert_eq!(db.max_write_replication_index(), Some(1));
 
-        let n = db.sync().await?;
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, Some(1));
 
         conn.execute_batch(
@@ -244,8 +252,10 @@ fn stream() {
             ",
         )
         .await?;
+        let replication_index = db.max_write_replication_index();
 
-        db.sync().await.unwrap();
+        let synced_replication_index = db.sync().await.unwrap().frame_no();
+        assert_eq!(synced_replication_index, replication_index);
 
         let rows = conn.query("select * from user", ()).await.unwrap();
 
@@ -299,7 +309,7 @@ fn embedded_replica_with_encryption() {
         )
         .await?;
 
-        let n = db.sync().await?;
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, None);
 
         let conn = db.connect()?;
@@ -307,7 +317,7 @@ fn embedded_replica_with_encryption() {
         conn.execute("CREATE TABLE user (id INTEGER NOT NULL PRIMARY KEY)", ())
             .await?;
 
-        let n = db.sync().await?;
+        let n = db.sync().await?.frame_no();
         assert_eq!(n, Some(1));
 
         let err = conn
@@ -399,6 +409,7 @@ fn replica_primary_reset() {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_server_config: Some(RpcServerConfig {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await.unwrap(),
@@ -461,7 +472,7 @@ fn replica_primary_reset() {
         )
         .await
         .unwrap();
-        let replica_index = replica.sync().await.unwrap().unwrap();
+        let replica_index = replica.sync().await.unwrap().frame_no().unwrap();
         let primary_index = Client::new()
             .get("http://primary:9090/v1/namespaces/default/stats")
             .await
@@ -520,7 +531,7 @@ fn replica_primary_reset() {
         )
         .await
         .unwrap();
-        let replica_index = replica.sync().await.unwrap().unwrap();
+        let replica_index = replica.sync().await.unwrap().frame_no().unwrap();
         let primary_index = Client::new()
             .get("http://primary:9090/v1/namespaces/default/stats")
             .await
@@ -625,7 +636,7 @@ fn replica_no_resync_on_restart() {
             )
             .await
             .unwrap();
-            db.sync().await.unwrap().unwrap()
+            db.sync().await.unwrap().frame_no().unwrap()
         };
         let first_sync = before.elapsed();
 
@@ -641,7 +652,7 @@ fn replica_no_resync_on_restart() {
             )
             .await
             .unwrap();
-            db.sync().await.unwrap().unwrap()
+            db.sync().await.unwrap().frame_no().unwrap()
         };
         let second_sync = before.elapsed();
 
@@ -683,6 +694,7 @@ fn replicate_with_snapshots() {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                     connector: TurmoilConnector,
                     disable_metrics: true,
+                    auth_key: None,
                 }),
                 rpc_server_config: Some(RpcServerConfig {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await.unwrap(),
@@ -725,7 +737,41 @@ fn replicate_with_snapshots() {
         .await
         .unwrap();
 
-        db.sync().await.unwrap();
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frames_synced(), 427);
+
+        let conn = db.connect().unwrap();
+
+        let mut res = conn.query("select count(*) from test", ()).await.unwrap();
+        assert_eq!(
+            *res.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get_value(0)
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            ROW_COUNT
+        );
+
+        let stats = client
+            .get("http://primary:9090/v1/namespaces/default/stats")
+            .await?
+            .json_value()
+            .await
+            .unwrap();
+
+        let stat = stats
+            .get("embedded_replica_frames_replicated")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+
+        assert_eq!(stat, 427);
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frames_synced(), 0);
 
         let conn = db.connect().unwrap();
 
@@ -1191,6 +1237,403 @@ fn txn_bug_issue_1283() {
         tx.commit().await?;
         Ok(())
     }
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn replicated_return() {
+    let tmp_embedded = tempdir().unwrap();
+    let tmp_embedded_path = tmp_embedded.path().to_owned();
+
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+
+    let notify = Arc::new(Notify::new());
+    let notify_clone = notify.clone();
+
+    init_tracing();
+    sim.host("primary", move || {
+        let notify = notify_clone.clone();
+        let path = tmp.path().to_path_buf();
+        async move {
+            let make_server = || async {
+                TestServer {
+                    path: path.clone().into(),
+                    user_api_config: UserApiConfig {
+                        ..Default::default()
+                    },
+                    admin_api_config: Some(AdminApiConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
+                        connector: TurmoilConnector,
+                        disable_metrics: true,
+                        auth_key: None,
+                    }),
+                    rpc_server_config: Some(RpcServerConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await.unwrap(),
+                        tls_config: None,
+                    }),
+                    ..Default::default()
+                }
+            };
+            let server = make_server().await;
+            let shutdown = server.shutdown.clone();
+
+            let fut = async move { server.start_sim(8080).await };
+
+            tokio::pin!(fut);
+
+            loop {
+                tokio::select! {
+                    res =  &mut fut => {
+                        res.unwrap();
+                        break
+                    }
+                    _ = notify.notified() => {
+                        shutdown.notify_waiters();
+                    },
+                }
+            }
+
+            drop(fut);
+
+            tokio::fs::File::create(path.join("dbs").join("default").join(".sentinel"))
+                .await
+                .unwrap();
+
+            notify.notify_waiters();
+            let server = make_server().await;
+            server.start_sim(8080).await.unwrap();
+
+            Ok(())
+        }
+    });
+
+    sim.client("client", async move {
+        let path = tmp_embedded_path.join("embedded");
+        let db = Database::open_with_remote_sync_connector(
+            path.to_str().unwrap(),
+            "http://primary:8080",
+            "",
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), None);
+        assert_eq!(rep.frames_synced(), 0);
+
+        let conn = db.connect()?;
+
+        conn.execute("CREATE TABLE user (id INTEGER)", ())
+            .await
+            .unwrap();
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), Some(1));
+        assert_eq!(rep.frames_synced(), 2);
+
+        conn.execute_batch(
+            "
+            INSERT into user(id) values (randomblob(4096));
+            INSERT into user(id) values (randomblob(4096));
+            INSERT into user(id) values (randomblob(4096));
+            ",
+        )
+        .await
+        .unwrap();
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), Some(10));
+        assert_eq!(rep.frames_synced(), 9);
+
+        // Regenerate log
+        notify.notify_waiters();
+        notify.notified().await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), Some(4));
+        assert_eq!(rep.frames_synced(), 5);
+
+        let mut row = conn.query("select count(*) from user", ()).await.unwrap();
+        let count = row.next().await.unwrap().unwrap().get::<u64>(0).unwrap();
+        assert_eq!(count, 3);
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn replicate_auth() {
+    init_tracing();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+
+    let (encoding, decoding) = common::auth::key_pair();
+    sim.host("primary", {
+        let decoding = decoding.clone();
+        move || {
+            let decoding = decoding.clone();
+            async move {
+                let tmp = tempdir()?;
+                let jwt_keys =
+                    vec![jsonwebtoken::DecodingKey::from_ed_components(&decoding).unwrap()];
+                let auth = Auth::new(user_auth_strategies::Jwt::new(jwt_keys));
+                let server = TestServer {
+                    path: tmp.path().to_owned().into(),
+                    user_api_config: UserApiConfig {
+                        hrana_ws_acceptor: None,
+                        auth_strategy: auth,
+                        ..Default::default()
+                    },
+                    admin_api_config: Some(AdminApiConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
+                        connector: TurmoilConnector,
+                        disable_metrics: true,
+                        auth_key: None,
+                    }),
+                    rpc_server_config: Some(RpcServerConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
+                        tls_config: None,
+                    }),
+                    ..Default::default()
+                };
+
+                server.start_sim(8080).await?;
+
+                Ok(())
+            }
+        }
+    });
+
+    sim.host("replica", {
+        let decoding = decoding.clone();
+        move || {
+            let decoding = decoding.clone();
+            async move {
+                let tmp = tempdir()?;
+                let jwt_keys =
+                    vec![jsonwebtoken::DecodingKey::from_ed_components(&decoding).unwrap()];
+                let auth = Auth::new(user_auth_strategies::Jwt::new(jwt_keys));
+                let server = TestServer {
+                    path: tmp.path().to_owned().into(),
+                    user_api_config: UserApiConfig {
+                        hrana_ws_acceptor: None,
+                        auth_strategy: auth,
+                        ..Default::default()
+                    },
+                    admin_api_config: Some(AdminApiConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
+                        connector: TurmoilConnector,
+                        disable_metrics: true,
+                        auth_key: None,
+                    }),
+                    rpc_client_config: Some(RpcClientConfig {
+                        remote_url: "http://primary:4567".into(),
+                        connector: TurmoilConnector,
+                        tls_config: None,
+                    }),
+                    ..Default::default()
+                };
+
+                server.start_sim(8080).await?;
+
+                Ok(())
+            }
+        }
+    });
+
+    sim.client("client", async move {
+        let token = encode(
+            &serde_json::json!({
+                "id": "default",
+            }),
+            &encoding,
+        );
+
+        // no auth
+        let tmp = tempdir().unwrap();
+        let db = Database::open_with_remote_sync_connector(
+            tmp.path().join("embedded").to_str().unwrap(),
+            "http://primary:8080",
+            "",
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+
+        assert!(db.sync().await.is_err());
+
+        let tmp = tempdir().unwrap();
+        let db = Database::open_with_remote_sync_connector(
+            tmp.path().join("embedded").to_str().unwrap(),
+            "http://replica:8080",
+            "",
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+
+        assert!(db.sync().await.is_err());
+
+        // auth
+        let tmp = tempdir().unwrap();
+        let db = Database::open_with_remote_sync_connector(
+            tmp.path().join("embedded").to_str().unwrap(),
+            "http://primary:8080",
+            token.clone(),
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+
+        assert!(db.sync().await.is_ok());
+
+        let tmp = tempdir().unwrap();
+        let db = Database::open_with_remote_sync_connector(
+            tmp.path().join("embedded").to_str().unwrap(),
+            "http://replica:8080",
+            token.clone(),
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+
+        assert!(db.sync().await.is_ok());
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn replicated_synced_frames_zero_when_no_data_synced() {
+    let tmp_embedded = tempdir().unwrap();
+    let tmp_embedded_path = tmp_embedded.path().to_owned();
+
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+
+    let notify = Arc::new(Notify::new());
+    let notify_clone = notify.clone();
+
+    init_tracing();
+    sim.host("primary", move || {
+        let notify = notify_clone.clone();
+        let path = tmp.path().to_path_buf();
+        async move {
+            let make_server = || async {
+                TestServer {
+                    path: path.clone().into(),
+                    user_api_config: UserApiConfig {
+                        ..Default::default()
+                    },
+                    admin_api_config: Some(AdminApiConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
+                        connector: TurmoilConnector,
+                        disable_metrics: true,
+                        auth_key: None,
+                    }),
+                    rpc_server_config: Some(RpcServerConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await.unwrap(),
+                        tls_config: None,
+                    }),
+                    ..Default::default()
+                }
+            };
+
+            let server = make_server().await;
+            let shutdown = server.shutdown.clone();
+
+            let fut = async move { server.start_sim(8080).await };
+
+            tokio::pin!(fut);
+
+            loop {
+                tokio::select! {
+                    res =  &mut fut => {
+                        res.unwrap();
+                        break
+                    }
+                    _ = notify.notified() => {
+                        shutdown.notify_waiters();
+                    },
+                }
+            }
+
+            drop(fut);
+
+            tokio::fs::File::create(path.join("dbs").join("default").join(".sentinel"))
+                .await
+                .unwrap();
+
+            notify.notify_waiters();
+            let server = make_server().await;
+            server.start_sim(8080).await.unwrap();
+
+            Ok(())
+        }
+    });
+
+    sim.client("client", async move {
+        let path = tmp_embedded_path.join("embedded");
+        let db = Database::open_with_remote_sync_connector(
+            path.to_str().unwrap(),
+            "http://primary:8080",
+            "",
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), None);
+        assert_eq!(rep.frames_synced(), 0);
+
+        let conn = db.connect()?;
+
+        conn.execute("CREATE TABLE user (id INTEGER)", ())
+            .await
+            .unwrap();
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), Some(1));
+        assert_eq!(rep.frames_synced(), 2);
+
+        conn.execute("INSERT into user(id) values (randomblob(4096));", ())
+            .await
+            .unwrap();
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), Some(4));
+        assert_eq!(rep.frames_synced(), 3);
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), Some(4));
+        assert_eq!(rep.frames_synced(), 0);
+
+        let rep = db.sync().await.unwrap();
+        assert_eq!(rep.frame_no(), Some(4));
+        assert_eq!(rep.frames_synced(), 0);
+
+        Ok(())
+    });
 
     sim.run().unwrap();
 }

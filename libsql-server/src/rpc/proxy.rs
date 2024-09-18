@@ -222,7 +222,7 @@ pub mod rpc {
     impl From<connection::program::Program> for Program {
         fn from(pgm: connection::program::Program) -> Self {
             Self {
-                steps: pgm.steps.into_iter().map(|s| s.into()).collect(),
+                steps: pgm.steps.iter().map(|s| s.clone().into()).collect(),
             }
         }
     }
@@ -327,7 +327,11 @@ impl ProxyService {
         };
 
         let auth = if let Some(auth) = auth {
-            let context = parse_grpc_auth_header(req.metadata());
+            let context =
+                parse_grpc_auth_header(req.metadata(), &auth.user_strategy.required_fields())
+                    .map_err(|e| {
+                        tonic::Status::internal(format!("Error parsing auth header: {}", e))
+                    })?;
             auth.authenticate(context)?
         } else {
             Authenticated::from_proxy_grpc_request(req)?
@@ -577,15 +581,7 @@ impl Proxy for ProxyService {
             .namespaces
             .with(ctx.namespace().clone(), |ns| {
                 let connection_maker = ns.db.connection_maker();
-                let notifier = ns
-                    .db
-                    .as_primary()
-                    .expect("invalid call to stream_exec: not a primary")
-                    .wal_wrapper
-                    .wrapper()
-                    .logger()
-                    .new_frame_notifier
-                    .subscribe();
+                let notifier = ns.db.notifier();
                 (connection_maker, notifier)
             })
             .await
@@ -637,7 +633,12 @@ impl Proxy for ProxyService {
                     tracing::debug!("connected: {client_id}");
                     match connection_maker.create().await {
                         Ok(conn) => {
-                            assert!(conn.is_primary());
+                            if !conn.is_primary() {
+                                return Err(tonic::Status::failed_precondition(
+                                    "cannot run schema migration against a replica",
+                                ));
+                            }
+
                             let conn = Arc::new(TimeoutConnection::new(conn));
                             let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
                             lock.insert(client_id, conn.clone());
@@ -686,21 +687,9 @@ impl Proxy for ProxyService {
 
         // FIXME: copypasta from execute(), creatively extract to a helper function
         let lock = self.clients.upgradable_read().await;
-        let (connection_maker, _new_frame_notifier) = self
+        let connection_maker = self
             .namespaces
-            .with(ctx.namespace().clone(), |ns| {
-                let connection_maker = ns.db.connection_maker();
-                let notifier = ns
-                    .db
-                    .as_primary()
-                    .unwrap()
-                    .wal_wrapper
-                    .wrapper()
-                    .logger()
-                    .new_frame_notifier
-                    .subscribe();
-                (connection_maker, notifier)
-            })
+            .with(ctx.namespace().clone(), |ns| ns.db.connection_maker())
             .await
             .map_err(|e| {
                 if let crate::error::Error::NamespaceDoesntExist(_) = e {
@@ -719,7 +708,12 @@ impl Proxy for ProxyService {
                 tracing::debug!("connected: {client_id}");
                 match connection_maker.create().await {
                     Ok(conn) => {
-                        assert!(conn.is_primary());
+                        if !conn.is_primary() {
+                            return Err(tonic::Status::failed_precondition(
+                                "cannot run schema migration against a replica",
+                            ));
+                        }
+
                         let conn = Arc::new(TimeoutConnection::new(conn));
                         let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
                         lock.insert(client_id, conn.clone());

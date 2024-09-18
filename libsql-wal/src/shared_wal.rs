@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,18 +7,22 @@ use arc_swap::ArcSwap;
 use crossbeam::deque::Injector;
 use crossbeam::sync::Unparker;
 use parking_lot::{Mutex, MutexGuard};
+use tokio::sync::{mpsc, watch};
+use uuid::Uuid;
 
+use crate::checkpointer::CheckpointMessage;
 use crate::error::{Error, Result};
 use crate::io::file::FileExt;
 use crate::io::Io;
-use crate::registry::WalRegistry;
+use crate::replication::storage::ReplicateFromStorage;
 use crate::segment::current::CurrentSegment;
+use crate::segment_swap_strategy::SegmentSwapStrategy;
 use crate::transaction::{ReadTransaction, Savepoint, Transaction, TxGuard, WriteTransaction};
 use libsql_sys::name::NamespaceName;
 
 #[derive(Default)]
 pub struct WalLock {
-    pub(crate) tx_id: Arc<Mutex<Option<u64>>>,
+    pub(crate) tx_id: Arc<async_lock::Mutex<Option<u64>>>,
     /// When a writer is popped from the write queue, its write transaction may not be reading from the most recent
     /// snapshot. In this case, we return `SQLITE_BUSY_SNAPHSOT` to the caller. If no reads were performed
     /// with that transaction before upgrading, then the caller will call us back immediately after re-acquiring
@@ -31,20 +35,69 @@ pub struct WalLock {
     pub(crate) waiters: Injector<(Unparker, u64)>,
 }
 
+pub(crate) trait SwapLog<IO: Io>: Sync + Send + 'static {
+    fn swap_current(&self, shared: &SharedWal<IO>, tx: &dyn TxGuard<IO::File>) -> Result<()>;
+}
+
 pub struct SharedWal<IO: Io> {
     pub(crate) current: ArcSwap<CurrentSegment<IO::File>>,
     pub(crate) wal_lock: Arc<WalLock>,
     pub(crate) db_file: IO::File,
     pub(crate) namespace: NamespaceName,
-    pub(crate) registry: Arc<WalRegistry<IO>>,
+    pub(crate) registry: Arc<dyn SwapLog<IO>>,
     #[allow(dead_code)] // used by replication
     pub(crate) checkpointed_frame_no: AtomicU64,
+    /// max frame_no acknowledged by the durable storage
+    pub(crate) durable_frame_no: Arc<Mutex<u64>>,
     pub(crate) new_frame_notifier: tokio::sync::watch::Sender<u64>,
+    pub(crate) stored_segments: Box<dyn ReplicateFromStorage>,
+    pub(crate) shutdown: AtomicBool,
+    pub(crate) checkpoint_notifier: mpsc::Sender<CheckpointMessage>,
+    pub(crate) io: Arc<IO>,
+    pub(crate) swap_strategy: Box<dyn SegmentSwapStrategy>,
 }
 
 impl<IO: Io> SharedWal<IO> {
+    #[tracing::instrument(skip(self), fields(namespace = self.namespace.as_str()))]
+    pub fn shutdown(&self) -> Result<()> {
+        tracing::info!("started namespace shutdown");
+        self.shutdown.store(true, Ordering::SeqCst);
+        // fixme: for infinite loop
+        let mut tx = loop {
+            let mut tx = Transaction::Read(self.begin_read(u64::MAX));
+            match self.upgrade(&mut tx) {
+                Ok(_) => break tx,
+                Err(Error::BusySnapshot) => continue,
+                Err(e) => return Err(e),
+            }
+        };
+
+        {
+            let mut tx = tx.as_write_mut().unwrap().lock();
+            tx.commit();
+            self.registry.swap_current(self, &tx)?;
+        }
+        // The current segment will not be used anymore. It's empty, but we still seal it so that
+        // the next startup doesn't find an unsealed segment.
+        self.current.load().seal(self.io.now())?;
+        tracing::info!("namespace shutdown");
+        Ok(())
+    }
+
+    pub fn new_frame_notifier(&self) -> watch::Receiver<u64> {
+        self.new_frame_notifier.subscribe()
+    }
+
     pub fn db_size(&self) -> u32 {
         self.current.load().db_size()
+    }
+
+    pub fn log_id(&self) -> Uuid {
+        self.current.load().log_id()
+    }
+
+    pub fn durable_frame_no(&self) -> u64 {
+        *self.durable_frame_no.lock()
     }
 
     #[tracing::instrument(skip_all)]
@@ -53,8 +106,13 @@ impl<IO: Io> SharedWal<IO> {
         // is not sealed. If the segment is sealed, retry with the current segment
         let current = self.current.load();
         current.inc_reader_count();
-        let (max_frame_no, db_size) =
-            current.with_header(|header| (header.last_committed(), header.db_size()));
+        let (max_frame_no, db_size, max_offset) = current.with_header(|header| {
+            (
+                header.last_committed(),
+                header.size_after(),
+                header.frame_count() as u64,
+            )
+        });
         let id = self.wal_lock.next_tx_id.fetch_add(1, Ordering::Relaxed);
         ReadTransaction {
             id,
@@ -64,6 +122,9 @@ impl<IO: Io> SharedWal<IO> {
             created_at: Instant::now(),
             conn_id,
             pages_read: 0,
+            namespace: self.namespace.clone(),
+            checkpoint_notifier: self.checkpoint_notifier.clone(),
+            max_offset,
         }
     }
 
@@ -73,41 +134,38 @@ impl<IO: Io> SharedWal<IO> {
             match tx {
                 Transaction::Write(_) => unreachable!("already in a write transaction"),
                 Transaction::Read(read_tx) => {
-                    {
-                        let mut reserved = self.wal_lock.reserved.lock();
-                        match *reserved {
-                            // we have already reserved the slot, go ahead and try to acquire
-                            Some(id) if id == read_tx.conn_id => {
-                                tracing::trace!("taking reserved slot");
-                                reserved.take();
-                                let lock = self.wal_lock.tx_id.lock();
+                    let mut reserved = self.wal_lock.reserved.lock();
+                    match *reserved {
+                        // we have already reserved the slot, go ahead and try to acquire
+                        Some(id) if id == read_tx.conn_id => {
+                            tracing::trace!("taking reserved slot");
+                            reserved.take();
+                            let lock = self.wal_lock.tx_id.lock_blocking();
+                            assert!(lock.is_none());
+                            let write_tx = self.acquire_write(read_tx, lock, reserved)?;
+                            *tx = Transaction::Write(write_tx);
+                            return Ok(());
+                        }
+                        None => {
+                            let lock = self.wal_lock.tx_id.lock_blocking();
+                            if lock.is_none() && self.wal_lock.waiters.is_empty() {
                                 let write_tx = self.acquire_write(read_tx, lock, reserved)?;
                                 *tx = Transaction::Write(write_tx);
                                 return Ok(());
                             }
-                            _ => (),
                         }
+                        _ => (),
                     }
 
-                    let lock = self.wal_lock.tx_id.lock();
-                    match *lock {
-                        None if self.wal_lock.waiters.is_empty() => {
-                            let write_tx =
-                                self.acquire_write(read_tx, lock, self.wal_lock.reserved.lock())?;
-                            *tx = Transaction::Write(write_tx);
-                            return Ok(());
-                        }
-                        Some(_) | None => {
-                            tracing::trace!(
-                                "txn currently held by another connection, registering to wait queue"
-                            );
-                            let parker = crossbeam::sync::Parker::new();
-                            let unparker = parker.unparker().clone();
-                            self.wal_lock.waiters.push((unparker, read_tx.conn_id));
-                            drop(lock);
-                            parker.park();
-                        }
-                    }
+                    tracing::trace!(
+                        "txn currently held by another connection, registering to wait queue"
+                    );
+
+                    let parker = crossbeam::sync::Parker::new();
+                    let unparker = parker.unparker().clone();
+                    self.wal_lock.waiters.push((unparker, read_tx.conn_id));
+                    drop(reserved);
+                    parker.park();
                 }
             }
         }
@@ -116,9 +174,11 @@ impl<IO: Io> SharedWal<IO> {
     fn acquire_write(
         &self,
         read_tx: &ReadTransaction<IO::File>,
-        mut tx_id_lock: MutexGuard<Option<u64>>,
+        mut tx_id_lock: async_lock::MutexGuard<Option<u64>>,
         mut reserved: MutexGuard<Option<u64>>,
     ) -> Result<WriteTransaction<IO::File>> {
+        assert!(reserved.is_none() || *reserved == Some(read_tx.conn_id));
+        assert!(tx_id_lock.is_none());
         // we read two fields in the header. There is no risk that a transaction commit in
         // between the two reads because this would require that:
         // 1) there would be a running txn
@@ -141,23 +201,27 @@ impl<IO: Io> SharedWal<IO> {
         let next_offset = current.count_committed() as u32;
         let next_frame_no = current.next_frame_no().get();
         *tx_id_lock = Some(read_tx.id);
+        let current_checksum = current.current_checksum();
 
         Ok(WriteTransaction {
             wal_lock: self.wal_lock.clone(),
             savepoints: vec![Savepoint {
+                current_checksum,
                 next_offset,
                 next_frame_no,
                 index: BTreeMap::new(),
             }],
             next_frame_no,
             next_offset,
+            current_checksum,
             is_commited: false,
             read_tx: read_tx.clone(),
+            recompute_checksum: None,
         })
     }
 
     #[tracing::instrument(skip(self, tx, buffer))]
-    pub fn read_frame(
+    pub fn read_page(
         &self,
         tx: &mut Transaction<IO::File>,
         page_no: u32,
@@ -198,22 +262,6 @@ impl<IO: Io> SharedWal<IO> {
             }
         }
 
-        // The replication index from page 1 must match that of the SharedWal
-        #[cfg(debug_assertions)]
-        {
-            use crossbeam::atomic::AtomicConsume;
-            use libsql_sys::ffi::Sqlite3DbHeader;
-            use zerocopy::FromBytes;
-
-            if page_no == 1 {
-                let header = Sqlite3DbHeader::read_from_prefix(buffer).unwrap();
-                assert_eq!(
-                    header.replication_index.get(),
-                    self.checkpointed_frame_no.load_consume()
-                );
-            }
-        }
-
         tx.pages_read += 1;
 
         Ok(())
@@ -232,30 +280,54 @@ impl<IO: Io> SharedWal<IO> {
             self.new_frame_notifier.send_replace(last_committed);
         }
 
-        // TODO: use config for max log size
-        if tx.is_commited() && current.count_committed() > 1000 {
+        if tx.is_commited() && self.swap_strategy.should_swap(current.count_committed()) {
             self.swap_current(&tx)?;
+            self.swap_strategy.swapped();
         }
 
         Ok(())
     }
 
+    /// Cut the current log, and register it for storage
+    pub fn seal_current(&self) -> Result<()> {
+        let mut tx = self.begin_read(u64::MAX).into();
+        self.upgrade(&mut tx)?;
+
+        let ret = {
+            let mut guard = tx.as_write_mut().unwrap().lock();
+            guard.commit();
+            self.swap_current(&mut guard)
+        };
+        // make sure the tx is always ended before it's dropped!
+        // FIXME: this is an issue with this design, since downgrade consume self, we can't have a
+        // drop implementation. The should probably have a Option<WriteTxnInner>, to that we can
+        // take &mut Self instead.
+        tx.end();
+
+        ret
+    }
+
     /// Swap the current log. A write lock must be held, but the transaction must be must be committed already.
-    fn swap_current(&self, tx: &TxGuard<IO::File>) -> Result<()> {
+    pub(crate) fn swap_current(&self, tx: &impl TxGuard<IO::File>) -> Result<()> {
         self.registry.swap_current(self, tx)?;
         Ok(())
     }
 
-    pub fn checkpoint(&self) -> Result<Option<u64>> {
-        let current = self.current.load();
-        match current.tail().checkpoint(&self.db_file)? {
-            Some(frame_no) => {
-                self.checkpointed_frame_no
-                    .store(frame_no, Ordering::Relaxed);
-                Ok(Some(frame_no))
-            }
-            None => Ok(None),
+    #[tracing::instrument(skip(self))]
+    pub async fn checkpoint(&self) -> Result<Option<u64>> {
+        let durable_frame_no = *self.durable_frame_no.lock();
+        let checkpointed_frame_no = self
+            .current
+            .load()
+            .tail()
+            .checkpoint(&self.db_file, durable_frame_no, self.log_id(), &self.io)
+            .await?;
+        if let Some(checkpointed_frame_no) = checkpointed_frame_no {
+            self.checkpointed_frame_no
+                .store(checkpointed_frame_no, Ordering::SeqCst);
         }
+
+        Ok(checkpointed_frame_no)
     }
 
     pub fn last_committed_frame_no(&self) -> u64 {
@@ -270,61 +342,32 @@ impl<IO: Io> SharedWal<IO> {
 
 #[cfg(test)]
 mod test {
-    use std::path::Path;
-
-    use crossbeam::atomic::AtomicConsume;
-    use libsql_sys::rusqlite::OpenFlags;
-    use tempfile::tempdir;
-
-    use crate::wal::LibsqlWalManager;
+    use crate::test::{seal_current_segment, TestEnv};
 
     use super::*;
 
-    #[test]
-    fn checkpoint() {
-        let tmp = tempdir().unwrap();
-        let resolver = |path: &Path| {
-            let name = path.file_name().unwrap().to_str().unwrap();
-            NamespaceName::from_string(name.to_string())
-        };
+    #[tokio::test]
+    async fn checkpoint() {
+        let env = TestEnv::new();
+        let conn = env.open_conn("test");
+        let shared = env.shared("test");
 
-        let registry =
-            Arc::new(WalRegistry::new(tmp.path().join("test/wals"), resolver, ()).unwrap());
-        let wal_manager = LibsqlWalManager::new(registry.clone());
-
-        let db_path = tmp.path().join("test/data");
-        let conn = libsql_sys::Connection::open(
-            db_path.clone(),
-            OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
-            wal_manager.clone(),
-            100000,
-            None,
-        )
-        .unwrap();
-
-        let shared = registry.open(&db_path).unwrap();
-
-        assert_eq!(shared.checkpointed_frame_no.load_consume(), 0);
+        assert_eq!(shared.checkpointed_frame_no.load(Ordering::Relaxed), 0);
 
         conn.execute("create table test (x)", ()).unwrap();
         conn.execute("insert into test values (12)", ()).unwrap();
         conn.execute("insert into test values (12)", ()).unwrap();
 
-        assert_eq!(shared.checkpointed_frame_no.load_consume(), 0);
+        assert_eq!(shared.checkpointed_frame_no.load(Ordering::Relaxed), 0);
 
-        let mut tx = Transaction::Read(shared.begin_read(666));
-        shared.upgrade(&mut tx).unwrap();
-        {
-            let mut tx = tx.as_write_mut().unwrap().lock();
-            tx.commit();
-            shared.swap_current(&tx).unwrap();
-        }
-        tx.end();
+        seal_current_segment(&shared);
 
-        let frame_no = shared.checkpoint().unwrap().unwrap();
+        *shared.durable_frame_no.lock() = 999999;
+
+        let frame_no = shared.checkpoint().await.unwrap().unwrap();
         assert_eq!(frame_no, 4);
-        assert_eq!(shared.checkpointed_frame_no.load_consume(), 4);
+        assert_eq!(shared.checkpointed_frame_no.load(Ordering::Relaxed), 4);
 
-        assert!(shared.checkpoint().unwrap().is_none());
+        assert!(shared.checkpoint().await.unwrap().is_none());
     }
 }

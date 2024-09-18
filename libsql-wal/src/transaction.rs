@@ -3,14 +3,22 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::{ArcMutexGuard, RawMutex};
+use libsql_sys::name::NamespaceName;
+use tokio::sync::mpsc;
 
-use crate::segment::current::CurrentSegment;
+use crate::checkpointer::CheckpointMessage;
+use crate::segment::current::{CurrentSegment, SegmentIndex};
 use crate::shared_wal::WalLock;
 
 pub enum Transaction<F> {
     Write(WriteTransaction<F>),
     Read(ReadTransaction<F>),
+}
+
+impl<T> From<ReadTransaction<T>> for Transaction<T> {
+    fn from(value: ReadTransaction<T>) -> Self {
+        Self::Read(value)
+    }
 }
 
 impl<F> Transaction<F> {
@@ -19,6 +27,14 @@ impl<F> Transaction<F> {
             Some(v)
         } else {
             None
+        }
+    }
+
+    pub fn into_write(self) -> Result<WriteTransaction<F>, Self> {
+        if let Self::Write(v) = self {
+            Ok(v)
+        } else {
+            Err(self)
         }
     }
 
@@ -63,6 +79,8 @@ pub struct ReadTransaction<F> {
     pub id: u64,
     /// Max frame number that this transaction can read
     pub max_frame_no: u64,
+    // max offset that can be read from the current log
+    pub max_offset: u64,
     pub db_size: u32,
     /// The segment to which we have a read lock
     pub current: Arc<CurrentSegment<F>>,
@@ -71,8 +89,11 @@ pub struct ReadTransaction<F> {
     /// number of pages read by this transaction. This is used to determine whether a write lock
     /// will be re-acquired.
     pub pages_read: usize,
+    pub namespace: NamespaceName,
+    pub checkpoint_notifier: mpsc::Sender<CheckpointMessage>,
 }
 
+// fixme: clone should probably not be implemented for this type, figure a way to do it
 impl<F> Clone for ReadTransaction<F> {
     fn clone(&self) -> Self {
         self.current.inc_reader_count();
@@ -84,37 +105,40 @@ impl<F> Clone for ReadTransaction<F> {
             created_at: self.created_at,
             conn_id: self.conn_id,
             pages_read: self.pages_read,
+            namespace: self.namespace.clone(),
+            checkpoint_notifier: self.checkpoint_notifier.clone(),
+            max_offset: self.max_offset,
         }
     }
 }
 
 impl<F> Drop for ReadTransaction<F> {
     fn drop(&mut self) {
-        // FIXME: if the count drops to 0, register for compaction.
-        self.current.dec_reader_count();
+        // FIXME: it would be more approriate to wait till the segment is stored before notfying,
+        // because we are not waiting for read to be released before that
+        if self.current.dec_reader_count() && self.current.is_sealed() {
+            let _: Result<_, _> = self
+                .checkpoint_notifier
+                .try_send(self.namespace.clone().into());
+        }
     }
 }
 
 pub struct Savepoint {
     pub next_offset: u32,
     pub next_frame_no: u64,
+    pub current_checksum: u32,
     pub index: BTreeMap<u32, u32>,
 }
 
 /// The savepoints must be passed from most recent to oldest
-pub fn merge_savepoints<'a>(
+pub(crate) fn merge_savepoints<'a>(
     savepoints: impl Iterator<Item = &'a BTreeMap<u32, u32>>,
-    out: &mut BTreeMap<u32, Vec<u32>>,
+    out: &SegmentIndex,
 ) {
     for savepoint in savepoints {
         for (k, v) in savepoint.iter() {
-            let entry = out.entry(*k).or_default();
-            match entry.last() {
-                Some(i) if i >= v => continue,
-                _ => {
-                    entry.push(*v);
-                }
-            }
+            out.insert(*k, *v);
         }
     }
 }
@@ -125,16 +149,60 @@ pub struct WriteTransaction<F> {
     pub savepoints: Vec<Savepoint>,
     pub next_frame_no: u64,
     pub next_offset: u32,
+    pub current_checksum: u32,
     pub is_commited: bool,
     pub read_tx: ReadTransaction<F>,
+    /// if transaction overwrote frames, then the running checksum needs to be recomputed.
+    /// We store here the lowest segment offset at which a frame was overwritten
+    pub recompute_checksum: Option<u32>,
 }
 
-pub struct TxGuard<'a, F> {
-    _lock: ArcMutexGuard<RawMutex, Option<u64>>,
+pub struct TxGuardOwned<F> {
+    lock: Option<async_lock::MutexGuardArc<Option<u64>>>,
+    inner: Option<WriteTransaction<F>>,
+}
+
+impl<F> TxGuardOwned<F> {
+    pub(crate) fn into_inner(mut self) -> WriteTransaction<F> {
+        self.lock.take();
+        self.inner.take().unwrap()
+    }
+}
+
+impl<F> Drop for TxGuardOwned<F> {
+    fn drop(&mut self) {
+        let _ = self.lock.take();
+        if let Some(inner) = self.inner.take() {
+            inner.downgrade();
+        }
+    }
+}
+
+impl<F> Deref for TxGuardOwned<F> {
+    type Target = WriteTransaction<F>;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("guard used after drop")
+    }
+}
+
+impl<F> DerefMut for TxGuardOwned<F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut().expect("guard used after drop")
+    }
+}
+
+pub trait TxGuard<F>: Deref<Target = WriteTransaction<F>> + DerefMut + Send + Sync {}
+
+impl<'a, F: Send + Sync> TxGuard<F> for TxGuardShared<'a, F> {}
+impl<F: Send + Sync> TxGuard<F> for TxGuardOwned<F> {}
+
+pub struct TxGuardShared<'a, F> {
+    _lock: async_lock::MutexGuardArc<Option<u64>>,
     inner: &'a mut WriteTransaction<F>,
 }
 
-impl<'a, F> Deref for TxGuard<'a, F> {
+impl<'a, F> Deref for TxGuardShared<'a, F> {
     type Target = WriteTransaction<F>;
 
     fn deref(&self) -> &Self::Target {
@@ -142,14 +210,14 @@ impl<'a, F> Deref for TxGuard<'a, F> {
     }
 }
 
-impl<'a, F> DerefMut for TxGuard<'a, F> {
+impl<'a, F> DerefMut for TxGuardShared<'a, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
     }
 }
 
 impl<F> WriteTransaction<F> {
-    pub fn merge_savepoints(&self, out: &mut BTreeMap<u32, Vec<u32>>) {
+    pub(crate) fn merge_savepoints(&self, out: &SegmentIndex) {
         let savepoints = self.savepoints.iter().rev().map(|s| &s.index);
         merge_savepoints(savepoints, out);
     }
@@ -160,22 +228,32 @@ impl<F> WriteTransaction<F> {
             next_offset: self.next_offset,
             next_frame_no: self.next_frame_no,
             index: BTreeMap::new(),
+            current_checksum: self.current_checksum,
         });
         savepoint_id
     }
 
-    pub fn lock(&mut self) -> TxGuard<F> {
-        if self.is_commited {
-            tracing::error!("transaction already commited");
-            todo!("txn has already been commited");
-        }
-
-        let g = self.wal_lock.tx_id.lock_arc();
+    pub fn lock(&mut self) -> TxGuardShared<F> {
+        let g = self.wal_lock.tx_id.lock_arc_blocking();
         match *g {
             // we still hold the lock, we can proceed
-            Some(id) if self.id == id => TxGuard {
+            Some(id) if self.id == id => TxGuardShared {
                 _lock: g,
                 inner: self,
+            },
+            // Somebody took the lock from us
+            Some(_) => todo!("lock stolen"),
+            None => todo!("not a transaction"),
+        }
+    }
+
+    pub fn into_lock_owned(self) -> TxGuardOwned<F> {
+        let g = self.wal_lock.tx_id.lock_arc_blocking();
+        match *g {
+            // we still hold the lock, we can proceed
+            Some(id) if self.id == id => TxGuardOwned {
+                lock: Some(g),
+                inner: Some(self),
             },
             // Somebody took the lock from us
             Some(_) => todo!("lock stolen"),
@@ -212,7 +290,9 @@ impl<F> WriteTransaction<F> {
         let Self {
             wal_lock, read_tx, ..
         } = self;
-        let mut lock = wal_lock.tx_id.lock();
+        // always acquire lock in this order: reserved, then tx_id
+        let mut reserved = wal_lock.reserved.lock();
+        let mut lock = wal_lock.tx_id.lock_blocking();
         match *lock {
             Some(lock_id) if lock_id == read_tx.id => {
                 lock.take();
@@ -220,7 +300,7 @@ impl<F> WriteTransaction<F> {
             _ => (),
         }
 
-        if let Some(id) = *wal_lock.reserved.lock() {
+        if let Some(id) = *reserved {
             tracing::trace!("tx already reserved by {id}");
             return read_tx;
         }
@@ -233,7 +313,7 @@ impl<F> WriteTransaction<F> {
                 }
                 crossbeam::deque::Steal::Success((unparker, id)) => {
                     tracing::trace!("waking up {id}");
-                    wal_lock.reserved.lock().replace(id);
+                    reserved.replace(id);
                     unparker.unpark();
                     break;
                 }
@@ -241,7 +321,7 @@ impl<F> WriteTransaction<F> {
             }
         }
 
-        tracing::debug!(id = read_tx.id, "lock released");
+        tracing::trace!(id = read_tx.id, "lock released");
 
         read_tx
     }
@@ -264,6 +344,10 @@ impl<F> WriteTransaction<F> {
     pub(crate) fn commit(&mut self) {
         self.is_commited = true;
     }
+
+    pub(crate) fn current_checksum(&self) -> u32 {
+        self.savepoints.last().unwrap().current_checksum
+    }
 }
 
 impl<F> Deref for WriteTransaction<F> {
@@ -277,26 +361,5 @@ impl<F> Deref for WriteTransaction<F> {
 impl<F> DerefMut for WriteTransaction<F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.read_tx
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::collections::BTreeMap;
-
-    use super::merge_savepoints;
-
-    #[test]
-    fn test_merge_savepoints() {
-        let first = [(1, 1), (3, 2)].into_iter().collect::<BTreeMap<_, _>>();
-        let second = [(1, 3), (4, 6)].into_iter().collect::<BTreeMap<_, _>>();
-
-        let mut out = BTreeMap::new();
-        merge_savepoints([first, second].iter().rev(), &mut out);
-
-        let mut iter = out.into_iter();
-        assert_eq!(iter.next(), Some((1, vec![3])));
-        assert_eq!(iter.next(), Some((3, vec![2])));
-        assert_eq!(iter.next(), Some((4, vec![6])));
     }
 }
